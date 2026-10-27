@@ -191,7 +191,10 @@ int w_present(lua_State *L)
 {
 	// B4-2 回放钩：present 前把行缓冲回放到当前渲染目标（屏幕显示的是回放结果，
 	// D8 语义替代）。回放幂等（缓冲全会话累积不消费，见 fr_capture.h）。
-	if (fr::capture_enabled())
+	// 无窗（拓扑 C 无头，FR_HEADLESS=1）时 isCreated()=false——回放需要渲染
+	// 目标（GL 上下文），跳过；行缓冲不受影响（tee/离线消费照常）。真 present
+	// 本体 isActive() 无窗早退（Graphics.cpp:354），安全直调。
+	if (fr::capture_enabled() && instance()->isCreated())
 		fr::capture_replay(instance());
 
 	luax_catchexcept(L, [&]() { instance()->present(L); });
@@ -1016,11 +1019,13 @@ int w_newVolumeImage(lua_State *L)
 
 int w_newImage(lua_State *L)
 {
-	luax_checkgraphicscreated(L);
-
 	// B4-2 语义替代钩：开关开时资产登记 + 代理（不建真 GPU 纹理，见 fr_capture.h）。
+	// 挂在 graphicscreated 守卫之前——捕获语义（登记 CPU 字节 + 代理）不依赖
+	// 窗口/GL 上下文（拓扑 C 无头解耦点，B4 阶段三 Task 4）。
 	if (fr::capture_enabled())
 		return fr::w_frNewImage(L);
+
+	luax_checkgraphicscreated(L);
 
 	Image::Slices slices(TEXTURE_2D);
 
@@ -1056,11 +1061,11 @@ int w_newImage(lua_State *L)
 
 int w_newQuad(lua_State *L)
 {
-	luax_checkgraphicscreated(L);
-
-	// B4-2 语义替代钩（同 w_newImage）。
+	// B4-2 语义替代钩（同 w_newImage——守卫前，无头解耦点）。
 	if (fr::capture_enabled())
 		return fr::w_frNewQuad(L);
+
+	luax_checkgraphicscreated(L);
 
 	Quad::Viewport v;
 	v.x = luaL_checknumber(L, 1);
@@ -1107,11 +1112,11 @@ int w_newQuad(lua_State *L)
 
 int w_newFont(lua_State *L)
 {
-	luax_checkgraphicscreated(L);
-
-	// B4-2 语义替代钩（同 w_newImage）。
+	// B4-2 语义替代钩（同 w_newImage——守卫前，无头解耦点）。
 	if (fr::capture_enabled())
 		return fr::w_frNewFont(L);
+
+	luax_checkgraphicscreated(L);
 
 	graphics::Font *font = nullptr;
 
@@ -1212,12 +1217,12 @@ int w_newParticleSystem(lua_State *L)
 
 int w_newCanvas(lua_State *L)
 {
-	luax_checkgraphicscreated(L);
-
-	// B4-2 语义替代钩（同 w_newImage；真 Canvas 需求走 _frNewCanvasReal，
-	// 边界见 fr_capture.h——验证帧回读 rig 用的真 Canvas 不经此路径）。
+	// B4-2 语义替代钩（同 w_newImage——守卫前，无头解耦点；真 Canvas 需求走
+	// _frNewCanvasReal，边界见 fr_capture.h——验证帧回读 rig 的真 Canvas不经此路径）。
 	if (fr::capture_enabled())
 		return fr::w_frNewCanvas(L);
+
+	luax_checkgraphicscreated(L);
 
 	Canvas::Settings settings;
 

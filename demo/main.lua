@@ -32,6 +32,9 @@
 local kernel = require("kernel")
 
 local FIXED_DT = 0.016667
+-- 拓扑 C 无头（B4 阶段三 Task 4）：FR_HEADLESS=1 + conf.lua t.window=false。
+-- 捕获/tee 全 GL-free；验证帧回读与回放跳过（探针定论的仅剩 GL 依赖点）。
+local HEADLESS = os.getenv("FR_HEADLESS") == "1"
 
 -- ------------------------------------------------------------------
 -- 参数解析（l0/main.lua 同款：arg[1]=游戏目录，游戏参数从 arg[2] 起）
@@ -256,7 +259,9 @@ local function frame_body()
 
 	frame = frame + 1
 	local verified = false
-	if frame == VERIFY_FRAME then
+	-- 无头（拓扑 C）跳过验证帧——Canvas 回读是 GL 依赖点（探针定论）；本帧
+	-- 捕获行走常规 love.draw() 路径，与有窗版逐字节同源（tee 一致性锚）。
+	if frame == VERIFY_FRAME and not HEADLESS then
 		-- 精确一次（tee 模式循环延续到 FRAMES，>= 会在后续帧重复验证）；
 		-- 非 tee：内部 exit(0)；tee：Canvas 验证后返回。
 		verify_frame()
@@ -277,6 +282,8 @@ local function frame_body()
 			io.stdout:flush()
 			os.exit(0)
 		end
+	elseif HEADLESS and frame >= FRAMES then
+		os.exit(0)             -- 无头非 tee：跑满即退（无验证帧出口）
 	end
 
 	if love.timer then love.timer.sleep(0.001) end
