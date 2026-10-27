@@ -8,6 +8,9 @@
 --                  no-op；会话缓冲为空。
 -- 离线回放（B4 阶段三 Task 3）：--offline-replay <in.fr|.frb> 独占——不跑
 --                  kernel/run loop，C 入口读流回放采集 D_CRC 后直接退出。
+-- 严格档注入回放（B5 Task 2）：--sim <in.fr> 独占——不跑 love.run，独立
+--                  帧循环重演内核（ev 行还原 push → poll 分发 → update 吃
+--                  录制 dt → draw 捕获再生行，与录制 out 行逐帧比对）。
 -- 资产等价基准（B4 阶段三口径）：红方块两版同色——捕获版 draw 回放经真纹理
 -- 物化（登记 ImageData 字节 → Image），真版 Image 由同一份红色 ImageData 建
 -- 真纹理。红条/背景为无资产 op，天然两版同色。
@@ -82,6 +85,12 @@ if OFFLINE_PATH then
 	os.exit(rc)
 	return
 end
+
+-- B5 Task 2：--sim <path> 独占模式（严格档注入回放——内核重演）。参数在此
+-- 解析、实现在 write_session 之后的 sim 段（依赖 ir_graphics/register_assets/
+-- take_delta/IN_EVENTS 先行定义；不与 --out/--inject 组合——独占帧循环，
+-- 不跑 love.run/verify_frame）。
+local SIM_PATH = get_val("--sim")
 
 -- tee₁ 模式：--out 存在即启用；缺省 = 现行验证 rig（stdout 报告，不写文件）。
 local OUT_PATH = get_val("--out")
@@ -402,6 +411,224 @@ local function frame_body()
 	end
 
 	if love.timer then love.timer.sleep(0.001) end
+end
+
+-- ---------------- B5 Task 2：--sim 严格档注入回放（内核重演） ----------------
+-- 独立帧循环（不跑 love.run/verify_frame）：读 .fr 文本流 → 逐帧把 ev 行
+-- 还原为 Lua 值 push 进事件队列（与录制同链路：帧首 push → pump → poll
+-- 取出 → 分发 kernel.handlers）→ kernel.update（dt 取流行，FIXED_DT 不用
+-- ——重演吃录制的 dt）→ kernel.draw(ir_graphics)（FR_CAPTURE=1 捕获再生
+-- out 行）→ 与录制 out 行逐行比对。纯行比对无 Canvas 回读——GL-free，
+-- FR_HEADLESS=1 可同用。stdout 逐帧 `SIM <frame> MATCH|MISMATCH <ndiff>
+-- | REC: <首差异录制行> | GEN: <首差异再生行>`（缺侧记 "-"；ev 条数漂移
+-- 计入差异）；末行 `SIM SUMMARY <frames> <match> <mismatch> <rc>`，全
+-- MATCH rc=0 否则 rc=1。.frb 本批不吃（fr-as 可转文本形态，如实登记）。
+
+-- 反转义（esc 的逆）：\\ \" \n \r \t
+local function unesc(s)
+	local out, i = {}, 1
+	while i <= #s do
+		local c = s:sub(i, i)
+		if c == "\\" then
+			local n = s:sub(i + 1, i + 1)
+			if n == "n" then out[#out + 1] = "\n"
+			elseif n == "r" then out[#out + 1] = "\r"
+			elseif n == "t" then out[#out + 1] = "\t"
+			elseif n == "\\" or n == '"' then out[#out + 1] = n
+			else error("fr-demo: 非法转义 \\" .. n) end
+			i = i + 2
+		else
+			out[#out + 1] = c
+			i = i + 1
+		end
+	end
+	return table.concat(out)
+end
+
+-- ev 行解析：`ev <slot> "<name>" <src> <argc> <variant...>` → {name=, args=}
+--（variant 还原：num→tonumber、str→去引号反转义、bool→"1"==v——tok_variant 逆）。
+local function parse_ev_row(line)
+	local pos = 1
+	-- 取一 token：以 " 起则按引号串取（转义原样保留，调用方 unesc）；否则到空白止
+	local function next_tok()
+		while pos <= #line and line:sub(pos, pos) == " " do pos = pos + 1 end
+		if pos > #line then return nil end
+		if line:sub(pos, pos) == '"' then
+			local i, out = pos + 1, {}
+			while true do
+				local ch = line:sub(i, i)
+				if ch == "" then error("fr-demo: ev 行引号串未闭合") end
+				if ch == '"' then pos = i + 1 return table.concat(out) end
+				if ch == "\\" then
+					out[#out + 1] = ch .. line:sub(i + 1, i + 1)
+					i = i + 2
+				else
+					out[#out + 1] = ch
+					i = i + 1
+				end
+			end
+		end
+		local j = line:find(" ", pos, true) or (#line + 1)
+		local t = line:sub(pos, j - 1)
+		pos = j
+		return t
+	end
+	local tag = next_tok()
+	if tag ~= "ev" then error("fr-demo: 非 ev 行进 parse_ev_row：" .. line) end
+	next_tok()                              -- slot（单事件帧恒 0，解析即弃）
+	local name = unesc(next_tok())          -- 事件名带引号去除
+	next_tok()                              -- src（严格档只注入，值不消费）
+	local argc = tonumber(next_tok())
+	if not argc or argc < 0 then error("fr-demo: ev 行 argc 非法：" .. line) end
+	local args = {}
+	for _ = 1, argc do
+		local kind = next_tok()
+		local val = next_tok()
+		if kind == "num" then
+			local n = tonumber(val)
+			if not n then error("fr-demo: num variant 非法：" .. line) end
+			args[#args + 1] = n
+		elseif kind == "bool" then
+			args[#args + 1] = (val == "1")
+		elseif kind == "str" then
+			args[#args + 1] = unesc(val)
+		else
+			error("fr-demo: 未知 variant: " .. tostring(kind))
+		end
+	end
+	return { name = name, args = args }
+end
+
+-- 流解析：.fr 文本 → 帧表 {{dt=num, ev={{name,args}}, out={行}}}。
+-- 分类按本 rig 会话组装口径：首帧块前只许 frb1/cmnt；帧块内 dt/asset/ev
+-- 归类（asset 行跳过——sim 侧 register_assets 同序重建，不比对），其余整行
+-- 进 out（与再生行逐字节比对）。
+local function parse_stream(path)
+	local fh, e = io.open(path, "rb")
+	if not fh then
+		io.stderr:write("fr-demo: 流文件打不开：", tostring(e), "\n")
+		os.exit(2)
+	end
+	local data = fh:read("*a")
+	fh:close()
+	local frames, cur, saw_head = {}, nil, false
+	for line in data:gmatch("[^\r\n]+") do
+		local op = line:match("^(%S+)")
+		if op == "frame" then
+			local n = tonumber(line:match("^frame (%d+)$"))
+			if not n or n ~= #frames then
+				io.stderr:write("fr-demo: frame 序号不连续：", line, "\n")
+				os.exit(2)
+			end
+			cur = { dt = nil, ev = {}, out = {} }
+			frames[#frames + 1] = cur
+		elseif not cur then
+			if op == "frb1" then
+				saw_head = true
+			elseif op ~= "cmnt" then
+				io.stderr:write("fr-demo: 首帧块前的未知行：", line, "\n")
+				os.exit(2)
+			end
+		elseif op == "dt" then
+			local v = tonumber(line:match("^dt (%S+)$"))
+			if not v then
+				io.stderr:write("fr-demo: dt 行非法：", line, "\n")
+				os.exit(2)
+			end
+			cur.dt = v
+		elseif op == "asset" then
+			-- 资产行：sim 侧 register_assets 重建（顺序/内容与录制同源）
+		elseif op == "ev" then
+			cur.ev[#cur.ev + 1] = parse_ev_row(line)
+		else
+			cur.out[#cur.out + 1] = line
+		end
+	end
+	if not saw_head or #frames == 0 then
+		io.stderr:write("fr-demo: 流缺 frb1 头行或帧块\n")
+		os.exit(2)
+	end
+	for i, fr in ipairs(frames) do
+		if not fr.dt then
+			io.stderr:write("fr-demo: 帧 ", tostring(i - 1), " 缺 dt 行\n")
+			os.exit(2)
+		end
+	end
+	return frames
+end
+
+if SIM_PATH then
+	-- 错误边界（offline 分支同款）：载入期裸错会落 love 蓝屏（交互挂住），
+	-- sim 一切错误收口为 stderr traceback + exit(1)。
+	local ok, rc = xpcall(function()
+		if os.getenv("FR_CAPTURE") ~= "1" then
+			io.stderr:write("fr-demo: --sim 需 FR_CAPTURE=1（重演要捕获再生 out 行）\n")
+			return 2
+		end
+		if SIM_PATH:match("%.frb$") then
+			io.stderr:write("fr-demo: --sim 本批只吃 .fr 文本（.frb 先经 fr-as 转）\n")
+			return 2
+		end
+		local frames = parse_stream(SIM_PATH)
+		register_assets()
+		local nmatch, nmis = 0, 0
+		for fi, fr in ipairs(frames) do
+			-- ① ev 行还原 push（帧首，同录制注入位）
+			for _, ev in ipairs(fr.ev) do
+				love.event.push(ev.name, unpack(ev.args))
+			end
+			-- ② 同录制链路：pump → poll → 白名单内分发（环境/连续事件不分发）
+			local dispatched = 0
+			love.event.pump()
+			local pi = love.event.poll()
+			while true do
+				local ev = { pi() }
+				local name = ev[1]
+				if name == nil then break end
+				if IN_EVENTS[name] then
+					dispatched = dispatched + 1
+					local h = kernel.handlers[name]
+					if h then h(unpack(ev, 2)) end
+				end
+			end
+			-- ③ update 吃录制 dt → draw 捕获再生行
+			kernel.update(fr.dt)
+			kernel.draw(ir_graphics)
+			local gen = take_delta()
+			-- ④ 比对：ev 条数漂移（push/poll 往返丢失或 OS 噪声混入）+ 逐行位置差
+			local ndiff, first_rec, first_gen = 0, nil, nil
+			local function mark_diff(rec, genl)
+				ndiff = ndiff + 1
+				if not first_rec then first_rec, first_gen = rec, genl end
+			end
+			if dispatched ~= #fr.ev then
+				mark_diff(("ev x%d"):format(#fr.ev), ("ev x%d"):format(dispatched))
+			end
+			for i = 1, math.max(#fr.out, #gen) do
+				if fr.out[i] ~= gen[i] then
+					mark_diff(fr.out[i] or "-", gen[i] or "-")
+				end
+			end
+			if ndiff == 0 then
+				nmatch = nmatch + 1
+				print(("SIM %d MATCH"):format(fi - 1))
+			else
+				nmis = nmis + 1
+				print(("SIM %d MISMATCH %d | REC: %s | GEN: %s")
+					:format(fi - 1, ndiff, first_rec, first_gen))
+			end
+		end
+		local rc2 = nmis == 0 and 0 or 1
+		print(("SIM SUMMARY %d %d %d %d"):format(#frames, nmatch, nmis, rc2))
+		io.stdout:flush()
+		return rc2
+	end, debug.traceback)
+	if not ok then
+		io.stderr:write("fr-demo sim error:\n", tostring(rc), "\n")
+		io.stderr:flush()
+		os.exit(1)
+	end
+	os.exit(rc)
 end
 
 function love.run()
