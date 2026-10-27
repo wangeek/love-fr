@@ -32,9 +32,11 @@
 --（cmd.tbl 指纹，调用侧算好传入；缺/坏报错 exit 2，L0 同款）、--seed n
 --（缺省 0）。确定性：FIXED_DT 固定 + cmnt 固定 + 无随机 → 两次运行逐字节
 -- 一致（测试锚）。验证帧（frame 3）的 Canvas 回读与 tee 并存：先验证后 tee。
--- B6 Task 1（end 段 s_crc）：present 时刻 C 侧全堆 GCtab 确定性序 CRC
---（fr_statediff——验证帧与 sim 循环显式调 _frStateCRC，两路径同一 C
--- 遍历）；帧块尾 `s_crc <u32十进制>`。d_crc 本批不加（口径归 Task 3）。
+-- B6 Task 1/1b（end 段 s_crc）：present 时刻 C 侧确定性 CRC——口径 =
+-- 注册状态根（kernel.state，载入期 _frStateRoot 登记）可达子图（Task 1b
+-- 裁定，D8 镜像范围；未注册根回退全堆）；验证帧与 sim 循环显式调
+-- _frStateSubCRC，两路径同一 C 遍历；帧块尾 `s_crc <u32十进制>`。
+-- d_crc 本批不加（口径归 Task 3）。
 --
 -- B5 Task 1（事件捕获 + 事件驱动化）：poll 循环不再丢弃——白名单内离散输入
 -- 事件逐条记 ev 行进当帧 in 缓冲（Lua 侧拼行，格式源对齐 l0/fr.lua 的
@@ -46,6 +48,12 @@
 -- in 段为空。注入脚本 --inject-click <x>,<y>（帧 1）/ --inject-key <key>
 --（帧 2）：帧首 push、poll 前——同帧取出（帧号 = 帧块号 0-based）。
 local kernel = require("kernel")
+
+-- B6 Task 1b：登记状态根——s_crc 口径 = kernel.state 可达子图 CRC。录制/
+-- --sim 两进程的 args 表与解析簿记表形态天然不同（Task 1 实证，全堆口径
+-- 曾 xfail），子图由同一代码+同一事件序列构建，跨进程等值可达。载入期
+-- 登记，先于一切收集点（帧 1 present 钩 / 验证帧 / --sim 循环共用之）。
+love.graphics._frStateRoot(kernel.state)
 
 -- B6 确定性前提：关 JIT 编译（解释执行）。JIT 起编时机随热点计数漂移
 --（验证帧的回读循环会把阈值提前推过线——窗口/无头两侧不同帧起编，
@@ -354,8 +362,9 @@ local function frame_body()
 		-- poll 逐条收 6 局部（name + 5 参：白名单事件最大 5 参——
 		-- mousepressed x y button istouch presses）。不建 { pi() } 表：
 		-- 环境事件（focus/mousemoved…）窗口版每帧多条、无头版为零，
-		-- 表垃圾进 GC 链会让 s_crc 随窗口/无头模式漂移（B6 堆口径的
-		-- 确定性前提）；参数列中无 nil（love 事件载荷不含 nil），尾部
+		-- 表垃圾进 GC 链曾在全堆口径下让 s_crc 随窗口/无头模式漂移
+		-- （B6 实测；Task 1b 子图口径已不依赖此约束，保留既定形态）；
+		-- 参数列中无 nil（love 事件载荷不含 nil），尾部
 		-- nil 计数即 argc。
 		local pi = love.event.poll()
 		local slot = 0
@@ -393,13 +402,12 @@ local function frame_body()
 	-- 无头（拓扑 C）跳过验证帧——Canvas 回读是 GL 依赖点（探针定论）；本帧
 	-- 捕获行走常规 love.draw() 路径，与有窗版逐字节同源（tee 一致性锚）。
 	if frame == VERIFY_FRAME and not HEADLESS then
-		-- B6 堆 CRC：验证帧不走 present（w_present 钩不触发），显式等价
-		-- 收集——与 present 钩同一 C 遍历；collectgarbage 同 present 路径
-		--（live 堆快照口径）；收集点在本位与 verify 后无差（verify/draw
-		-- 不分配 GCtab，见 VERIFY_PTS 提升注）。无头本帧走 present 钩，
-		-- 两侧每帧恰一份。
+		-- B6 状态 CRC（Task 1b 子图口径）：验证帧不走 present（w_present
+		-- 钩不触发），显式等价收集——与 present 钩同一 C 遍历（根已载入期
+		-- 登记）；collectgarbage 沿用 present 路径既定口径（子图外噪声本
+		-- 就不入 CRC）。无头本帧走 present 钩，两侧每帧恰一份。
 		collectgarbage("collect")
-		love.graphics._frStateCRC()
+		love.graphics._frStateSubCRC()
 		-- 精确一次（tee 模式循环延续到 FRAMES，>= 会在后续帧重复验证）；
 		-- 非 tee：内部 exit(0)；tee：Canvas 验证后返回。
 		verify_frame()
@@ -623,11 +631,12 @@ if SIM_PATH then
 			-- ③ update 吃录制 dt → draw 捕获再生行
 			kernel.update(fr.dt)
 			kernel.draw(ir_graphics)
-			-- B6 堆 CRC：present 等价点收集（录制侧在 present 钩、take_delta
-			-- 前——同序：take_delta 的表分配不进本帧比对值）。
-			-- collectgarbage 同录制侧口径（live 堆快照）。
+			-- B6 状态 CRC（Task 1b 子图口径）：present 等价点收集，与录制侧
+			-- 同一出口（_frStateSubCRC，根已载入期登记）——子图只含
+			-- kernel.state，本进程 parse/簿记表不进 CRC，跨进程等值可达；
+			-- collectgarbage 沿用录制侧既定口径。
 			collectgarbage("collect")
-			local scrc = love.graphics._frStateCRC()
+			local scrc = love.graphics._frStateSubCRC()
 			local gen = take_delta()
 			-- ④ 比对：ev 条数漂移（push/poll 往返丢失或 OS 噪声混入）+ 逐行位置差
 			local ndiff, first_rec, first_gen = 0, nil, nil

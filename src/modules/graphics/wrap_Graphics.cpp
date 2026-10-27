@@ -190,9 +190,10 @@ int w_discard(lua_State *L)
 
 int w_present(lua_State *L)
 {
-	// B6 堆 CRC 档（常开）：present 时刻（帧 commit 点）全堆 GCtab 确定性
-	// 序 CRC 入当帧缓存——end 段 s_crc 数据源。无窗也采（tee 无头/有窗
-	// 逐字节一致锚；堆遍历纯字节读无 GL 依赖，红线见 fr_statediff.h）。
+	// B6 状态 CRC 档（常开，Task 1b 口径）：present 时刻（帧 commit 点）
+	// 确定性 CRC 入当帧缓存——end 段 s_crc 数据源；根已注册（demo 载入期
+	// 登记 kernel.state）→ 可达子图 CRC，否则全堆回退。无窗也采（tee
+	// 无头/有窗逐字节一致锚；遍历纯字节读无 GL 依赖，红线见 fr_statediff.h）。
 	if (fr::capture_enabled())
 		fr::capture_state_crc(L);
 
@@ -3088,8 +3089,10 @@ static const luaL_Reg functions[] =
 	{ "_frImageDataCRC", fr::w_frImageDataCRC },
 	{ "_frCanvasProbe", fr::w_frCanvasProbe },
 	{ "_frOfflineReplay", fr::w_frOfflineReplay },
-	{ "_frStateCRC", fr::w_frStateCRC },     // B6：堆 CRC 显式出口（验证帧/sim）
-	{ "_frTakeSCrcs", fr::w_frTakeSCrcs },   // B6：每帧 s_crc 数组（end 段组装）
+	{ "_frStateRoot", fr::w_frStateRoot },       // B6 Task 1b：登记状态根（子图 s_crc 口径）
+	{ "_frStateSubCRC", fr::w_frStateSubCRC },   // B6 Task 1b：子图 CRC 显式出口（验证帧/sim）
+	{ "_frStateCRC", fr::w_frStateCRC },         // B6：全堆 CRC 口径保留（审计/对照）
+	{ "_frTakeSCrcs", fr::w_frTakeSCrcs },       // B6：每帧 s_crc 数组（end 段组装）
 
 	{ "newImage", w_newImage },
 	{ "newArrayImage", w_newArrayImage },
