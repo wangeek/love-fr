@@ -20,8 +20,9 @@
  * frame 0 = checkpoint 注入，会话组装时机归 Task 4）。
  *
  * 语义替代四件套（Task 3）：FR_CAPTURE=1 时 w_newImage/newFont/newCanvas/
- * newQuad 提前转入 w_frNew*——不建真 GPU 资产，登记 CPU 字节（L0 data_hex
- * 假数据口径：ImageData 路径 demo 期无真解码记 "-"，文件路径读真实字节）
+ * newQuad 提前转入 w_frNew*——不建真 GPU 资产，登记 CPU 字节
+ * （B4 阶段三真字节口径：newImage(ImageData) 路径登记 ImageData 像素 RGBA8
+ * hex；newFont(size) 登记内嵌 Vera.ttf 字节 + size；文件路径读真实字节）
  * 后返回资产代理 userdata（full userdata + luaL_newmetatable("fr_asset_proxy")
  * 元表，携带 id/kind；弃 lightuserdata 方案：代理要过 GC 与元表类型检查，
  * full userdata 与 11.5 wrap 惯例同构）。
@@ -29,17 +30,19 @@
  * demo 的验证帧走 _frNewCanvasReal（开关无关真建，dpiScale=1 定像素域）；
  * 语义替代版 newCanvas 只服务"内核代码里当资产引用"场景（登记+代理）。
  *
- * 占位渲染（demo 期如实标注）：代理无真纹理，draw 行回放 = 纯色矩形占位，
- * 伪色按 id 确定性映射（1→白、2→青、其它→灰）；print 行回放 = 同伪色小
- * 矩形（8x16 每字符）；rect 行回放 = 真实 rectangle（无资产依赖）。
- * 真纹理物化归 B4 阶段三。
+ * 回放渲染（B4 阶段三真物化口径）：draw/print 行回放优先走真纹理物化
+ * （fr_materialize：登记字节 → Image/Font，会话内缓存）；未登记 id 或物化
+ * 失败回退占位——draw = 伪色矩形（伪色按 id 确定性映射：1→白、2→青、
+ * 其它→灰）+ stderr 告警，print = 同伪色小矩形（8x16 每字符）；
+ * rect 行回放 = 真实 rectangle（无资产依赖）。
  *
  * 本批边界（Task 3）：
  *   - draw 的 rot/sx/sy/ox/oy 原样记行（demo 恒 0/1，L0 shim 同口径——结算
  *     只动 x/y，锚定 Texture::draw 的 Matrix4(tm, m) 复合 + transformXY 两点法）；
- *   - print 多段 ColoredString 顺序拼接为单串（demo 单段）；回放行解析用
- *     sscanf("\"%[^\"]\"")，转义反转义不实现（demo 文本受控，tee 解析归
- *     fr_check 侧）；
+ *     物化回放侧由裸参数重建 Matrix4(x,y,rot,sx,sy,ox,oy,0,0)
+ *     （luax_checkstandardtransform 同构，kx/ky 恒 0 不记行）；
+ *   - print 多段 ColoredString 顺序拼接为单串（demo 单段）；回放行解析
+ *     手写引号扫描 + 转义反转义（esc 的逆，tee round-trip 覆盖）；
  *   - rect 行 x/y 经 getTransform 结算，w/h 直通（L0 shim 同口径 TODO）；
  *     rx/ry>0 的圆角回放降级直角（demo 不传）；
  *   - 回放执行时变换栈取 present 时刻状态（demo 恒 origin，捕获即结算后
@@ -98,9 +101,23 @@ std::vector<std::string> capture_take_rows();
 // 资产行文本（登记序，Task 4 会话组装按 frame 0 checkpoint 注入）。
 std::vector<std::string> fr_take_asset_rows();
 
+// 物化侧查表（fr_materialize 用）：登记资产的只读拷贝视图。data_hex 空 =
+// 登记时无字节（"-" 占位，物化不可用）。image 字节口径 = RGBA8 像素
+// （协议约定，非 RGBA8 源资产归后续批次）；font 字节 = TrueType 数据。
+struct FrAssetInfo
+{
+	int kind = 0;
+	int w = 0, h = 0;                 // image / canvas
+	float size = 0.0f;                // font
+	std::string data_hex;             // image / font 真字节 hex（空 = "-"）
+};
+
+// 按 id 查登记资产（未登记 → false）。
+bool fr_lookup_asset(love::uint32 id, FrAssetInfo &out);
+
 // 语义替代四件套（w_new* 挂钩转入，开关开时生效）：
-//   newImage(filename|ImageData) → 文件路径读真实字节登记 / ImageData 假数据
-//   newFont(size)                → size 登记（f32 口径）
+//   newImage(filename|ImageData) → 登记真字节 hex（文件字节 / ImageData 像素）
+//   newFont(size)                → size 登记（f32 口径）+ Vera.ttf 真字节
 //   newCanvas(w, h)              → 登记（不建真 Canvas，见文件头边界）
 //   newQuad(x, y, w, h, sw, sh)  → 登记
 // 返回资产代理 userdata。

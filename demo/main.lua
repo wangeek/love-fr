@@ -6,9 +6,9 @@
 --                  到验证 Canvas；_frTakeSession/_frTakeAssets 有会话行。
 --   FR_CAPTURE 未设 真 clear/draw/print/rectangle 直接执行；回放缓冲为空
 --                  no-op；会话缓冲为空。
--- 资产等价基准（Task 3 验收口径）：白方块两版同色——捕获版 draw 占位渲染按
--- id→伪色（1→白），真版 Image 由白色 ImageData 建真纹理。红条/背景为无资产
--- op，天然两版同色。
+-- 资产等价基准（B4 阶段三口径）：红方块两版同色——捕获版 draw 回放经真纹理
+-- 物化（登记 ImageData 字节 → Image），真版 Image 由同一份红色 ImageData 建
+-- 真纹理。红条/背景为无资产 op，天然两版同色。
 -- 自定义 love.run（Task 2 骨架沿用）：pump → poll 丢弃 → update(dt) →
 --   验证帧（frame 3：真 Canvas（_frNewCanvasReal，开关无关）→ draw →
 --   _frReplay → 三点 getPixel 回读）→ draw → present。
@@ -116,11 +116,12 @@ end
 -- 真版值 = 真 Image/Font——kernel 侧两种模式同构。
 local FR_ASSETS = {}
 
--- 资产注册（捕获版 newImage(ImageData) 走语义替代：登记 w,h + 假数据模式；
--- 真版：建 32x32 白 Image——行为等价基准，占位伪色 id=1→白与其对齐）。
+-- 资产注册（B4 阶段三真字节口径）：newImage 传真 ImageData（32x32 全红——
+-- 捕获版登记其 RGBA 字节 hex，物化回放回读同色，像素锚 (20,30)=红）；
+-- newFont(14) 传真参数（捕获版登记内嵌 Vera.ttf 字节 + size）。
 local function register_assets()
 	local img_data = love.image.newImageData(32, 32)
-	img_data:mapPixel(function() return 1, 1, 1, 1 end) -- 全白
+	img_data:mapPixel(function() return 1, 0, 0, 1 end) -- 全红
 	FR_ASSETS[1] = love.graphics.newImage(img_data)
 	FR_ASSETS[2] = love.graphics.newFont(14)
 end
@@ -157,7 +158,7 @@ end
 local VERIFY_FRAME = 3
 local frame = 0
 
--- 验证帧自证：三点像素回读（背景黑 / 方块区白 / 红条红）+ 汇总行。
+-- 验证帧自证：三点像素回读（背景黑 / 方块区真红物化 / 红条红）+ 汇总行。
 local function verify_frame()
 	-- 真 Canvas 开关无关（语义替代版不建真 Canvas，见 fr_capture.h 边界）；
 	-- _frNewCanvasReal 定 dpiScale=1（像素域=逻辑域）。
@@ -169,7 +170,7 @@ local function verify_frame()
 	local img = c:newImageData()
 	local pts = {
 		{ 400, 100, 0, 0, 0 },       -- 背景（黑 clear）
-		{ 20, 30, 255, 255, 255 },   -- 方块区（hero 11,20 起 32x32；占位=伪色白）
+		{ 20, 30, 255, 0, 0 },       -- 方块区（hero 11,20 起 32x32；真字节物化=真红）
 		{ 320, 468, 255, 0, 0 },     -- 红条（0,456,640,24 fill）
 	}
 	local npass = 0

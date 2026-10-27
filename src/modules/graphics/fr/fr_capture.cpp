@@ -3,6 +3,7 @@
  **/
 
 #include "modules/graphics/fr/fr_capture.h"
+#include "modules/graphics/fr/fr_materialize.h"
 
 // LOVE
 #include "common/Exception.h"
@@ -16,6 +17,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+// modules/font/Font.cpp 的默认字体：在 love::font 命名空间内 include
+// Vera.ttf.h（内嵌 TTF，仅该 TU include）——符号归属该命名空间，登记真
+// 字节直接外部引用（newFont(size) 的默认字体即它）。
+namespace love
+{
+namespace font
+{
+extern unsigned char Vera_ttf[];
+extern unsigned int Vera_ttf_len;
+} // font
+} // love
 
 namespace fr
 {
@@ -76,6 +89,49 @@ static std::string esc(const std::string &s)
 		case '\t': out += "\\t"; break;
 		default: out += c;
 		}
+	}
+	return out;
+}
+
+// esc 的逆（replay 行解析用）：\\ \" \n \r \t 展开为原始字节；非法转义
+//（esc 不产的形态）原样保留两字符——原文本含 `\x` 时 esc 产 `\\x`，逆展开
+// 得回 `\x`，round-trip 保真。
+static std::string unesc(const std::string &s)
+{
+	std::string out;
+	out.reserve(s.size());
+	for (size_t i = 0; i < s.size(); i++)
+	{
+		if (s[i] != '\\' || i + 1 >= s.size())
+		{
+			out += s[i];
+			continue;
+		}
+		char c = s[++i];
+		switch (c)
+		{
+		case '\\': out += '\\'; break;
+		case '"': out += '"'; break;
+		case 'n': out += '\n'; break;
+		case 'r': out += '\r'; break;
+		case 't': out += '\t'; break;
+		default: out += '\\'; out += c; break;
+		}
+	}
+	return out;
+}
+
+// 字节 → 小写 hex（资产行 data 段；fr.lua 的 hex 编码同构）。
+static std::string hex_encode(const void *bytes, size_t n)
+{
+	static const char *hexd = "0123456789abcdef";
+	const love::uint8 *p = (const love::uint8 *) bytes;
+	std::string out;
+	out.reserve(n * 2);
+	for (size_t i = 0; i < n; i++)
+	{
+		out += hexd[p[i] >> 4];
+		out += hexd[p[i] & 0xF];
 	}
 	return out;
 }
@@ -174,22 +230,28 @@ static const char *kind_name(int kind)
 	return names[kind];
 }
 
-// fr.render_asset 同构（资产行文本，登记序入 asset_rows）。
+// fr.render_asset 同构（资产行文本，登记序入 asset_rows）。data 段可为
+// 任意长 hex（image 像素 / font TTF 字节）——std::string 拼接，不走定长
+// 缓冲（B4 阶段三实测：128B snprintf 截断 8192 字符 hex）。
 static std::string render_asset_row(const FrAsset &a)
 {
-	char buf[128];
+	char head[128];
 	if (a.kind == FR_ASSET_CANVAS)
-		snprintf(buf, sizeof(buf), "asset canvas %u %d %d", a.id, a.w, a.h);
-	else if (a.kind == FR_ASSET_QUAD)
-		snprintf(buf, sizeof(buf), "asset quad %u %.6f %.6f %.6f %.6f %.6f %.6f",
+	{
+		snprintf(head, sizeof(head), "asset canvas %u %d %d", a.id, a.w, a.h);
+		return head;
+	}
+	if (a.kind == FR_ASSET_QUAD)
+	{
+		snprintf(head, sizeof(head), "asset quad %u %.6f %.6f %.6f %.6f %.6f %.6f",
 		         a.id, a.qx, a.qy, a.qw, a.qh, a.qsw, a.qsh);
-	else if (a.kind == FR_ASSET_IMAGE)
-		snprintf(buf, sizeof(buf), "asset image %u %d %d %s",
-		         a.id, a.w, a.h, a.data_hex.empty() ? "-" : a.data_hex.c_str());
+		return head;
+	}
+	if (a.kind == FR_ASSET_IMAGE)
+		snprintf(head, sizeof(head), "asset image %u %d %d ", a.id, a.w, a.h);
 	else
-		snprintf(buf, sizeof(buf), "asset font %u %.6f %s",
-		         a.id, a.size, a.data_hex.empty() ? "-" : a.data_hex.c_str());
-	return buf;
+		snprintf(head, sizeof(head), "asset font %u %.6f ", a.id, a.size);
+	return std::string(head) + (a.data_hex.empty() ? "-" : a.data_hex);
 }
 
 // 资产代理：full userdata + 专属元表（11.5 wrap 惯例同构；弃 lightuserdata
@@ -267,6 +329,23 @@ static love::uint32 register_asset(const FrAsset &a)
 	return a.id;
 }
 
+// 物化侧查表（fr_materialize 用）：登记资产的只读拷贝视图。
+bool fr_lookup_asset(love::uint32 id, FrAssetInfo &out)
+{
+	for (const FrAsset &a : assets())
+	{
+		if (a.id != id)
+			continue;
+		out.kind = a.kind;
+		out.w = a.w;
+		out.h = a.h;
+		out.size = a.size;
+		out.data_hex = a.data_hex;
+		return true;
+	}
+	return false;
+}
+
 // ------------------------------------------------------------------
 // 语义替代四件套（w_new* 挂钩转入）
 // ------------------------------------------------------------------
@@ -278,8 +357,8 @@ int w_frNewImage(lua_State *L)
 
 	if (lua_type(L, 1) == LUA_TSTRING)
 	{
-		// 文件路径：读真实字节登记（假数据模式不适用——有真文件字节）。
-		// 宽高 demo 期无真解码登记 0（占位渲染不可见；真解码归 B4 阶段三）。
+		// 文件路径：读真实字节登记。宽高 demo 期无真解码登记 0（占位渲染
+		// 不可见；真解码归后续批次——hex 是编码后文件字节，非像素域）。
 		const char *filename = luaL_checkstring(L, 1);
 		love::filesystem::Filesystem *fs =
 			love::Module::getInstance<love::filesystem::Filesystem>(love::Module::M_FILESYSTEM);
@@ -289,23 +368,18 @@ int w_frNewImage(lua_State *L)
 		love::filesystem::FileData *data = nullptr;
 		love::luax_catchexcept(L, [&]() { data = fs->read(filename); });
 
-		size_t n = data->getSize();
-		const love::uint8 *bytes = (const love::uint8 *) data->getData();
-		static const char *hexd = "0123456789abcdef";
-		a.data_hex.reserve(n * 2);
-		for (size_t i = 0; i < n; i++)
-		{
-			a.data_hex += hexd[bytes[i] >> 4];
-			a.data_hex += hexd[bytes[i] & 0xF];
-		}
+		a.data_hex = hex_encode(data->getData(), data->getSize());
 		data->release();
 	}
 	else
 	{
-		// ImageData 路径：data_hex 假数据模式（L0 口径，demo 期无真解码）。
+		// ImageData 路径（B4 阶段三真字节口径）：像素字节原样 hex 登记
+		//（协议口径 RGBA8 像素域，物化侧按 newImageData(w,h,RGBA8,bytes)
+		// 同链重建，见 fr_materialize.cpp）。
 		love::image::ImageData *d = love::luax_checktype<love::image::ImageData>(L, 1);
 		a.w = d->getWidth();
 		a.h = d->getHeight();
+		a.data_hex = hex_encode(d->getData(), d->getSize());
 	}
 
 	a.id = next_asset_id();
@@ -316,13 +390,16 @@ int w_frNewImage(lua_State *L)
 
 int w_frNewFont(lua_State *L)
 {
-	// demo 边界：仅 newFont(size) 形态（文件/Rasterizer 形态需真解码，阶段三）。
+	// demo 边界：仅 newFont(size) 形态。默认字体 = Font.cpp 内嵌 Vera.ttf
+	//（DefaultFontData）——登记其真字节 + size（B4 阶段三；物化侧
+	// newTrueTypeRasterizer 同链重建）。文件/Rasterizer 形态归后续批次。
 	if (lua_type(L, 1) != LUA_TNUMBER)
 		return luaL_error(L, "fr.newFont: 语义替代仅支持 newFont(size) 形态（B4 demo 边界）");
 
 	FrAsset a;
 	a.kind = FR_ASSET_FONT;
 	a.size = (float) luaL_checknumber(L, 1);
+	a.data_hex = hex_encode(love::font::Vera_ttf, love::font::Vera_ttf_len);
 	a.id = next_asset_id();
 	register_asset(a);
 	push_proxy(L, a);
@@ -408,35 +485,101 @@ void capture_replay(love::graphics::Graphics *gfx)
 		}
 		else if (row.compare(0, 5, "draw ") == 0)
 		{
-			// 占位渲染：代理无真纹理，id→伪色矩形（尺寸=登记宽高；quad≠0 也按
-			// 整图占位——视口裁剪归阶段三，见 fr_capture.h）。坐标为捕获时结算
-			// 的世界系直通值（回放时变换栈恒 origin，无二次变换）。
+			// 真纹理物化优先（B4 阶段三）：登记字节 → Image（fr_materialize，
+			// 会话内缓存），行内颜色 = 捕获时 setColor 状态（纹理色 × 画色）。
+			// quad≠0 仍走占位（Quad 视口裁剪归后续批次）；未登记/物化失败
+			// 回退伪色矩形（伪色按 id 确定性映射）。
 			unsigned tex = 0, quad = 0;
 			float x = 0, y = 0, rot = 0, sx = 0, sy = 0, ox = 0, oy = 0;
 			int r = 0, g = 0, b = 0, a = 255;
 			if (sscanf(row.c_str(), "draw %u %u %f %f %f %f %f %f %f %d %d %d %d",
 			           &tex, &quad, &x, &y, &rot, &sx, &sy, &ox, &oy, &r, &g, &b, &a) == 13)
 			{
-				gfx->setColor(pseudocolor(tex));
-				int w = 0, h = 0;
-				lookup_asset_size(tex, w, h);
-				if (w > 0 && h > 0)
-					gfx->rectangle(love::graphics::Graphics::DRAW_FILL, x, y, (float) w, (float) h);
+				love::graphics::Image *img =
+					(quad == 0) ? fr_materialize_image(gfx, tex) : nullptr;
+				if (img != nullptr)
+				{
+					// 裸参数矩阵重建（luax_checkstandardtransform 的
+					// Matrix4(x,y,a,sx,sy,ox,oy,kx,ky) 同构；x/y 已是捕获时
+					// 结算的世界系，回放变换栈恒 origin，无二次变换）。
+					love::Matrix4 m(x, y, rot, sx, sy, ox, oy, 0.0f, 0.0f);
+					gfx->setColor(love::Colorf(r / 255.0f, g / 255.0f,
+					                           b / 255.0f, a / 255.0f));
+					gfx->draw((love::graphics::Drawable *) img, m);
+				}
+				else
+				{
+					gfx->setColor(pseudocolor(tex));
+					int w = 0, h = 0;
+					lookup_asset_size(tex, w, h);
+					if (w > 0 && h > 0)
+						gfx->rectangle(love::graphics::Graphics::DRAW_FILL, x, y, (float) w, (float) h);
+				}
 			}
 		}
 		else if (row.compare(0, 6, "print ") == 0)
 		{
-			// 占位渲染：font id→伪色小矩形（8x16 每字符），非真字形。
+			// 行解析（esc 反转义）：`print <font> "<escaped>" x y rot sx sy
+			// rgba`——手写引号扫描（sscanf %[^"] 会被转义 \" 截断），
+			// 引号内转义序列经 unesc 展开为原始字节。
 			unsigned font = 0;
-			char text[256] = "";
 			float x = 0, y = 0, rot = 0, sx = 0, sy = 0;
 			int r = 0, g = 0, b = 0, a = 255;
-			if (sscanf(row.c_str(), "print %u \"%255[^\"]\" %f %f %f %f %f %d %d %d %d",
-			           &font, text, &x, &y, &rot, &sx, &sy, &r, &g, &b, &a) == 11)
+			std::string text;
+			bool parsed = false;
+
+			const char *p = row.c_str() + 6;
+			char *endp = nullptr;
+			font = (unsigned) strtoul(p, &endp, 10);
+			if (endp > p && endp[0] == ' ' && endp[1] == '"')
 			{
-				gfx->setColor(pseudocolor(font));
-				gfx->rectangle(love::graphics::Graphics::DRAW_FILL, x, y,
-				               8.0f * (float) strlen(text), 16.0f);
+				const char *q = endp + 2;
+				std::string raw;
+				while (*q != '\0')
+				{
+					if (*q == '\\' && q[1] != '\0')
+					{
+						raw += q[0];
+						raw += q[1];
+						q += 2;
+						continue;
+					}
+					if (*q == '"')
+						break;
+					raw += *q++;
+				}
+				if (*q == '"')
+				{
+					text = unesc(raw);
+					parsed = sscanf(q + 1, " %f %f %f %f %f %d %d %d %d",
+					                &x, &y, &rot, &sx, &sy, &r, &g, &b, &a) == 9;
+				}
+			}
+
+			if (parsed)
+			{
+				// 真字形优先（登记 Vera 字节 → Rasterizer → Font）；失败回退
+				// 伪色小矩形（8x16 每字符）。行内颜色 = 捕获时 setColor 状态
+				//（多段 ColoredString 已拼单串，段色不存——demo 单段）。
+				love::graphics::Font *fnt = fr_materialize_font(gfx, font);
+				if (fnt != nullptr)
+				{
+					love::Colorf cf(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+					gfx->setColor(cf);
+					std::vector<love::graphics::Font::ColoredString> str;
+					love::graphics::Font::ColoredString cs;
+					cs.str = text;
+					cs.color = cf;
+					str.push_back(cs);
+					love::Matrix4 m(x, y, rot, sx, sy, 0.0f, 0.0f, 0.0f, 0.0f);
+					gfx->print(str, fnt, m);
+				}
+				else
+				{
+					gfx->setColor(pseudocolor(font));
+					gfx->rectangle(love::graphics::Graphics::DRAW_FILL, x, y,
+					               8.0f * (float) text.size(), 16.0f);
+				}
 			}
 		}
 		else if (row.compare(0, 5, "rect ") == 0)
