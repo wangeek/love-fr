@@ -1018,6 +1018,10 @@ int w_newImage(lua_State *L)
 {
 	luax_checkgraphicscreated(L);
 
+	// B4-2 语义替代钩：开关开时资产登记 + 代理（不建真 GPU 纹理，见 fr_capture.h）。
+	if (fr::capture_enabled())
+		return fr::w_frNewImage(L);
+
 	Image::Slices slices(TEXTURE_2D);
 
 	bool dpiscaleset = false;
@@ -1053,6 +1057,10 @@ int w_newImage(lua_State *L)
 int w_newQuad(lua_State *L)
 {
 	luax_checkgraphicscreated(L);
+
+	// B4-2 语义替代钩（同 w_newImage）。
+	if (fr::capture_enabled())
+		return fr::w_frNewQuad(L);
 
 	Quad::Viewport v;
 	v.x = luaL_checknumber(L, 1);
@@ -1100,6 +1108,10 @@ int w_newQuad(lua_State *L)
 int w_newFont(lua_State *L)
 {
 	luax_checkgraphicscreated(L);
+
+	// B4-2 语义替代钩（同 w_newImage）。
+	if (fr::capture_enabled())
+		return fr::w_frNewFont(L);
 
 	graphics::Font *font = nullptr;
 
@@ -1201,6 +1213,11 @@ int w_newParticleSystem(lua_State *L)
 int w_newCanvas(lua_State *L)
 {
 	luax_checkgraphicscreated(L);
+
+	// B4-2 语义替代钩（同 w_newImage；真 Canvas 需求走 _frNewCanvasReal，
+	// 边界见 fr_capture.h——验证帧回读 rig 用的真 Canvas 不经此路径）。
+	if (fr::capture_enabled())
+		return fr::w_frNewCanvas(L);
 
 	Canvas::Settings settings;
 
@@ -2345,6 +2362,52 @@ int w_getStats(lua_State *L)
 
 int w_draw(lua_State *L)
 {
+	// B4-2 捕获钩：首参为 fr 资产代理（语义替代产物）→ 解析 id 记行，抑制真执行。
+	// 坐标结算：Matrix4 t(getTransform(), m) 与 Texture::draw 的复合同构
+	// （Texture.cpp:143），transformXY 两点法取 (x,y) 世界坐标；rot/sx/sy/
+	// ox/oy 原样记行（demo 恒 0/1，L0 shim 同口径，见 fr_capture.h）。
+	if (fr::capture_enabled() && fr::fr_isasset(L, 1))
+	{
+		uint32 texid = fr::fr_assetid(L, 1);
+		uint32 quadid = 0;
+		int startidx = 2;
+
+		if (fr::fr_isasset(L, 2))
+		{
+			quadid = fr::fr_assetid(L, 2);
+			startidx = 3;
+		}
+
+		if (luax_istype(L, startidx, math::Transform::type))
+			return luaL_error(L, "fr: draw 捕获不支持 Transform 形参形态（demo 期用裸坐标）");
+
+		const Colorf color = instance()->getColor();
+
+		luax_checkstandardtransform(L, startidx, [&](const Matrix4 &m)
+		{
+			// 裸参数重取（luax_checkstandardtransform 已对同槽位做过类型校验）。
+			float x   = (float) luaL_optnumber(L, startidx + 0, 0.0);
+			float y   = (float) luaL_optnumber(L, startidx + 1, 0.0);
+			float rot = (float) luaL_optnumber(L, startidx + 2, 0.0);
+			float sx  = (float) luaL_optnumber(L, startidx + 3, 1.0);
+			float sy  = (float) luaL_optnumber(L, startidx + 4, sx);
+			float ox  = (float) luaL_optnumber(L, startidx + 5, 0.0);
+			float oy  = (float) luaL_optnumber(L, startidx + 6, 0.0);
+
+			// Lua 位置参数 (x,y) 已被吸收进 m 的平移项（luax_checkstandardtransform
+			// 的 Matrix4 构造），绘制锚点 = 局部 (0,0)——取 t(0,0) 即世界系锚点
+			//（与 Texture::draw 的顶点变换同构：quad 顶点 (0,0) → 世界锚点）。
+			Matrix4 t(instance()->getTransform(), m);
+			Vector2 src[1] = { Vector2(0.0f, 0.0f) };
+			Vector2 dst[1];
+			t.transformXY(dst, src, 1);
+
+			fr::capture_draw(texid, quadid, dst[0].x, dst[0].y, rot, sx, sy, ox, oy, color);
+		});
+
+		return 0;
+	}
+
 	Drawable *drawable = nullptr;
 	Texture *texture = nullptr;
 	Quad *quad = nullptr;
@@ -2427,6 +2490,52 @@ int w_drawInstanced(lua_State *L)
 
 int w_print(lua_State *L)
 {
+	// B4-2 捕获钩：第 2 参为 fr 资产代理（语义替代字体）→ 解析 font id 记行，
+	// 抑制真执行。坐标结算同 w_draw（getTransform 复合 + transformXY 两点法）。
+	if (fr::capture_enabled())
+	{
+		uint32 fontid = 0;
+		int startidx = 2;
+
+		if (fr::fr_isasset(L, 2))
+		{
+			fontid = fr::fr_assetid(L, 2);
+			startidx = 3;
+		}
+
+		if (luax_istype(L, startidx, math::Transform::type))
+			return luaL_error(L, "fr: print 捕获不支持 Transform 形参形态（demo 期用裸坐标）");
+
+		std::vector<Font::ColoredString> str;
+		luax_checkcoloredstring(L, 1, str);
+
+		// 多段 ColoredString 顺序拼接为行内单串（demo 单段，见 fr_capture.h 边界）。
+		std::string text;
+		for (const Font::ColoredString &s : str)
+			text += s.str;
+
+		const Colorf color = instance()->getColor();
+
+		luax_checkstandardtransform(L, startidx, [&](const Matrix4 &m)
+		{
+			float x   = (float) luaL_optnumber(L, startidx + 0, 0.0);
+			float y   = (float) luaL_optnumber(L, startidx + 1, 0.0);
+			float rot = (float) luaL_optnumber(L, startidx + 2, 0.0);
+			float sx  = (float) luaL_optnumber(L, startidx + 3, 1.0);
+			float sy  = (float) luaL_optnumber(L, startidx + 4, sx);
+
+			// 同 w_draw：位置参数已吸收进 m，取 t(0,0) = 世界系锚点。
+			Matrix4 t(instance()->getTransform(), m);
+			Vector2 src[1] = { Vector2(0.0f, 0.0f) };
+			Vector2 dst[1];
+			t.transformXY(dst, src, 1);
+
+			fr::capture_print(fontid, text, dst[0].x, dst[0].y, rot, sx, sy, color);
+		});
+
+		return 0;
+	}
+
 	std::vector<Font::ColoredString> str;
 	luax_checkcoloredstring(L, 1, str);
 
@@ -2645,6 +2754,38 @@ int w_line(lua_State *L)
 
 int w_rectangle(lua_State *L)
 {
+	// B4-2 捕获钩：mode/x/y/w/h 解析复用原实现同款，记行抑制真执行。
+	// 行 mode 走 cmd.tbl 口径（0=fill 1=line），love 枚举反向（DRAW_LINE=0）——
+	// 此处正向换算，回放侧反向换算（fr_capture.cpp）。x/y 经 getTransform 结算
+	// （rectangle 无局部变换参数）；w/h 直通（L0 shim 同口径）；width = 线宽
+	// 状态（L0 形参 width 的 love 对应物是 setLineWidth 状态）。
+	if (fr::capture_enabled())
+	{
+		Graphics::DrawMode mode;
+		const char *str = luaL_checkstring(L, 1);
+		if (!Graphics::getConstant(str, mode))
+			return luax_enumerror(L, "draw mode", Graphics::getConstants(mode), str);
+
+		float x = (float) luaL_checknumber(L, 2);
+		float y = (float) luaL_checknumber(L, 3);
+		float w = (float) luaL_checknumber(L, 4);
+		float h = (float) luaL_checknumber(L, 5);
+		float rx = (float) luaL_optnumber(L, 6, 0.0);
+		float ry = (float) luaL_optnumber(L, 7, rx);
+
+		const float width = instance()->getLineWidth();
+		const Colorf color = instance()->getColor();
+
+		const Matrix4 &t = instance()->getTransform();
+		Vector2 src[2] = { Vector2(0.0f, 0.0f), Vector2(x, y) };
+		Vector2 dst[2];
+		t.transformXY(dst, src, 2);
+
+		const uint8 rowmode = (mode == Graphics::DRAW_FILL) ? 0 : 1;
+		fr::capture_rect(rowmode, dst[1].x, dst[1].y, w, h, rx, ry, width, color);
+		return 0;
+	}
+
 	Graphics::DrawMode mode;
 	const char *str = luaL_checkstring(L, 1);
 	if (!Graphics::getConstant(str, mode))
@@ -2929,7 +3070,9 @@ static const luaL_Reg functions[] =
 
 	// B4-2 FR 捕获层出口（fork 魔改，fr_capture.h）。
 	{ "_frTakeSession", fr::w_frTakeSession },
+	{ "_frTakeAssets", fr::w_frTakeAssets },
 	{ "_frReplay", fr::w_frReplay },
+	{ "_frNewCanvasReal", fr::w_frNewCanvasReal },
 
 	{ "newImage", w_newImage },
 	{ "newArrayImage", w_newArrayImage },

@@ -1,25 +1,75 @@
--- demo/main.lua —— B4-2 Task 2 捕获 rig（fork demo，取代 Task 0 的 hint 骨架）。
+-- demo/main.lua —— B4-2 Task 3 捕获 rig（fork demo，Task 2 rig 的全帧扩展）。
 -- 两种模式同一条路径，开关只改变 C++ 侧行为（行为等价回归）：
---   FR_CAPTURE=1   w_clear 抑制真执行只记行；present 钩回放行缓冲上屏；
---                  _frReplay 把行缓冲回放到验证 Canvas；_frTakeSession 有会话行。
---   FR_CAPTURE 未设 真 clear 直接执行；回放缓冲为空 no-op；会话行为空。
--- 自定义 love.run（替换默认循环——本批需要 present 钩时序可控，参照官方 11.5
--- love.run 骨架改）：pump → poll 丢弃（Task 2 无事件）→ update(dt) →
---   验证帧（frame N：切 Canvas → draw → _frReplay → getPixel 回读）→ draw → present。
--- 官方骨架的两处省略（rig 口径，实测记录）：
+--   FR_CAPTURE=1   w_clear/draw/print/rectangle 抑制真执行只记行；构造四件套
+--                  （newImage/newFont/newCanvas/newQuad）走语义替代（资产登记
+--                  + 代理）；present 钩回放行缓冲上屏；_frReplay 把行缓冲回放
+--                  到验证 Canvas；_frTakeSession/_frTakeAssets 有会话行。
+--   FR_CAPTURE 未设 真 clear/draw/print/rectangle 直接执行；回放缓冲为空
+--                  no-op；会话缓冲为空。
+-- 资产等价基准（Task 3 验收口径）：白方块两版同色——捕获版 draw 占位渲染按
+-- id→伪色（1→白），真版 Image 由白色 ImageData 建真纹理。红条/背景为无资产
+-- op，天然两版同色。
+-- 自定义 love.run（Task 2 骨架沿用）：pump → poll 丢弃 → update(dt) →
+--   验证帧（frame 3：真 Canvas（_frNewCanvasReal，开关无关）→ draw →
+--   _frReplay → 三点 getPixel 回读）→ draw → present。
+-- 官方骨架的两处省略（rig 口径，Task 2 实测记录）：
 --   - 不做 love.graphics.clear(getBackgroundColor()) 预清屏——它会混入捕获会话行；
 --   - 不做 isActive 守卫——rig 只跑 3 帧即退出，窗口最小化非目标场景。
+-- dt 固定 0.016667（L0 golden 同源），hero.x 帧序 11.000020/12.000040/13.000060
+-- （10 + 60*dt*k，qf 域复算）——真实墙钟时间不定，会话行坐标不可锚定。
 local kernel = require("kernel")
 
--- IR 适配层：kernel 说 IR 语义（rgba8，0-255），翻译为 love.graphics 的 0-1 浮点。
+local FIXED_DT = 0.016667
+
+-- IR 适配层：kernel 说 IR 语义（rgba8 0-255、mode 0=fill 1=line，cmd.tbl 口径），
+-- 翻译为 love.graphics 的 0-1 浮点 + 字符串 mode + setColor 状态折算。
 local ir_graphics = {}
+
+local function setircolor(r, g, b, a)
+	love.graphics.setColor(r / 255, g / 255, b / 255, a / 255)
+end
+
 function ir_graphics.clear(r, g, b, a)
 	love.graphics.clear(r / 255, g / 255, b / 255, a / 255)
 end
--- draw/print/rectangle 适配：Task 3（语义替代四件套）接入。
+
+-- 资产号 → 对象映射（kernel 说资产号，L0 main.lua 注册序口径：image=1、
+-- font=2；quad=0 = 空资产哨兵）。捕获版值 = 代理 userdata（w_frNew* 返回），
+-- 真版值 = 真 Image/Font——kernel 侧两种模式同构。
+local FR_ASSETS = {}
+
+-- 资产注册（捕获版 newImage(ImageData) 走语义替代：登记 w,h + 假数据模式；
+-- 真版：建 32x32 白 Image——行为等价基准，占位伪色 id=1→白与其对齐）。
+local function register_assets()
+	local img_data = love.image.newImageData(32, 32)
+	img_data:mapPixel(function() return 1, 1, 1, 1 end) -- 全白
+	FR_ASSETS[1] = love.graphics.newImage(img_data)
+	FR_ASSETS[2] = love.graphics.newFont(14)
+end
+
+function ir_graphics.draw(tex, quad, x, y, rot, sx, sy, ox, oy, r, g, b, a)
+	setircolor(r, g, b, a)
+	-- quad=0 = 整图哨兵（L0 口径）：demo 无真 Quad，直传整图形态。
+	-- 捕获版第 2 参为 number → quad 记 0，行 `draw <tex> 0 x y ...` 同构。
+	love.graphics.draw(FR_ASSETS[tex], x, y, rot, sx, sy, ox, oy)
+end
+
+function ir_graphics.print(font, text, x, y, rot, sx, sy, r, g, b, a)
+	setircolor(r, g, b, a)
+	love.graphics.print(text, FR_ASSETS[font], x, y, rot, sx, sy)
+end
+
+-- cmd.tbl: rect mode 0=fill 1=line（love DrawMode 枚举反向，C++ 侧换算）。
+local IR_MODES = { [0] = "fill", [1] = "line" }
+
+function ir_graphics.rectangle(mode, x, y, w, h, rx, ry, width, r, g, b, a)
+	setircolor(r, g, b, a)
+	love.graphics.setLineWidth(width)
+	love.graphics.rectangle(IR_MODES[mode] or "fill", x, y, w, h, rx, ry)
+end
 
 function love.update(dt)
-	kernel.update(dt)
+	kernel.update(FIXED_DT)
 end
 
 function love.draw()
@@ -28,9 +78,40 @@ end
 
 local VERIFY_FRAME = 3
 local frame = 0
-local dt = 0.0
 
--- 帧体（错误边界内）：Task 2 rig 的一切行为。
+-- 验证帧自证：三点像素回读（背景黑 / 方块区白 / 红条红）+ 汇总行。
+local function verify_frame()
+	-- 真 Canvas 开关无关（语义替代版不建真 Canvas，见 fr_capture.h 边界）；
+	-- _frNewCanvasReal 定 dpiScale=1（像素域=逻辑域）。
+	local c = love.graphics._frNewCanvasReal(640, 480)
+	love.graphics.setCanvas(c)
+	love.draw()                 -- 捕获模式：记录行（真执行被抑制）；关闭模式：真画
+	love.graphics._frReplay()   -- 捕获模式：行缓冲回放到 canvas；关闭模式：空缓冲 no-op
+	love.graphics.setCanvas()   -- 先解绑：active Canvas 不许 newImageData（11.5 实测报错）
+	local img = c:newImageData()
+	local pts = {
+		{ 400, 100, 0, 0, 0 },       -- 背景（黑 clear）
+		{ 20, 30, 255, 255, 255 },   -- 方块区（hero 11,20 起 32x32；占位=伪色白）
+		{ 320, 468, 255, 0, 0 },     -- 红条（0,456,640,24 fill）
+	}
+	local npass = 0
+	for _, p in ipairs(pts) do
+		local r, g, b = img:getPixel(p[1], p[2])
+		r, g, b = math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5)
+		print(string.format("PIXEL %d %d %d %d %d", p[1], p[2], r, g, b))
+		if r == p[3] and g == p[4] and b == p[5] then npass = npass + 1 end
+	end
+	print(string.format("PIXELS %d %d", #pts, npass))
+	-- 会话行（测试判据）：资产行 + out 段行（clear/draw/print/rect）
+	local assets = love.graphics._frTakeAssets()
+	for _, row in ipairs(assets) do print(row) end
+	local rows = love.graphics._frTakeSession()
+	for _, row in ipairs(rows) do print(row) end
+	io.stdout:flush()
+	os.exit(0)
+end
+
+-- 帧体（错误边界内）：rig 的一切行为。
 local function frame_body()
 	if love.event then
 		love.event.pump()
@@ -38,33 +119,16 @@ local function frame_body()
 			if name == "quit" then
 				return 0
 			end
-			-- 其余事件 Task 2 丢弃（kernel.handlers 的接入归 Task 3）
+			-- 其余事件 rig 丢弃（kernel.handlers 注入归 Task 4）
 		end
 	end
 
-	if love.timer then dt = love.timer.step() end
-	if love.update then love.update(dt) end
+	if love.timer then love.timer.step() end
+	love.update(FIXED_DT)
 
 	frame = frame + 1
 	if frame >= VERIFY_FRAME then
-		-- 自证（Canvas 主案）：render-to-texture 不依赖主屏交换，回读同步可靠。
-		local c = love.graphics.newCanvas(64, 64)
-		love.graphics.setCanvas(c)
-		love.draw()                 -- 捕获模式：记录行（真执行被抑制）；关闭模式：真画
-		love.graphics._frReplay()   -- 捕获模式：行缓冲回放到 canvas；关闭模式：空缓冲 no-op
-		love.graphics.setCanvas()   -- 先解绑：active Canvas 不许 newImageData（11.5 实测报错）
-		local img = c:newImageData()
-		local r, g, b = img:getPixel(0, 0)
-		-- getPixel 返回 0-1 浮点，×255 四舍五入打印整数（测试判据 PIXEL 1 0 0）
-		print(string.format("PIXEL %d %d %d",
-			math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5)))
-		-- 会话行（测试 3）：捕获模式含 `clear 1 0 0 255`（每帧一条）
-		local rows = love.graphics._frTakeSession()
-		for _, row in ipairs(rows) do
-			print(row)
-		end
-		io.stdout:flush()
-		os.exit(0)
+		verify_frame()
 	end
 
 	if love.graphics then
@@ -76,6 +140,7 @@ local function frame_body()
 end
 
 function love.run()
+	register_assets()  -- 资产号自 1 起，须在任何 draw 前（kernel.draw 按号引用）
 	if love.timer then love.timer.step() end
 	return function()
 		-- 错误边界：帧内 Lua 错误 → stderr traceback + exit(1)，

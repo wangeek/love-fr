@@ -5,17 +5,32 @@
 #include "modules/graphics/fr/fr_capture.h"
 
 // LOVE
+#include "common/Exception.h"
 #include "common/Module.h"
 #include "common/runtime.h"
+#include "filesystem/Filesystem.h"
+#include "graphics/Canvas.h"
+#include "image/ImageData.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace fr
 {
 
+// ------------------------------------------------------------------
+// 会话行缓冲（out 段 / 资产段）
+// ------------------------------------------------------------------
+
 static std::vector<std::string> &rows()
+{
+	static std::vector<std::string> r;
+	return r;
+}
+
+static std::vector<std::string> &asset_rows()
 {
 	static std::vector<std::string> r;
 	return r;
@@ -31,6 +46,10 @@ bool capture_enabled()
 	return enabled;
 }
 
+// ------------------------------------------------------------------
+// 行文本工具（fr.lua 同构）
+// ------------------------------------------------------------------
+
 static int rgba8(float v)
 {
 	if (v < 0.0f)
@@ -39,6 +58,31 @@ static int rgba8(float v)
 		v = 1.0f;
 	return (int) lroundf(v * 255.0f);
 }
+
+// fr.esc 同构：\ " \n \r \t 转义（控制字符拒收在 Lua 侧 render 纪律内，
+// 本层只转义不校验——demo 文本受控，完整校验归 fr_check 解析侧）。
+static std::string esc(const std::string &s)
+{
+	std::string out;
+	out.reserve(s.size() + 8);
+	for (char c : s)
+	{
+		switch (c)
+		{
+		case '\\': out += "\\\\"; break;
+		case '"': out += "\\\""; break;
+		case '\n': out += "\\n"; break;
+		case '\r': out += "\\r"; break;
+		case '\t': out += "\\t"; break;
+		default: out += c;
+		}
+	}
+	return out;
+}
+
+// ------------------------------------------------------------------
+// 捕获点（clear + Task 3 draw/print/rect）
+// ------------------------------------------------------------------
 
 void capture_clear(const love::graphics::OptionalColorf &color,
                    const std::vector<love::graphics::OptionalColorf> &colors)
@@ -65,6 +109,285 @@ void capture_clear(const love::graphics::OptionalColorf &color,
 	rows().push_back(buf);
 }
 
+void capture_draw(love::uint32 texid, love::uint32 quadid, float x, float y, float rot,
+                  float sx, float sy, float ox, float oy, const love::Colorf &color)
+{
+	char buf[256];
+	snprintf(buf, sizeof(buf),
+	         "draw %u %u %.6f %.6f %.6f %.6f %.6f %.6f %.6f %d %d %d %d",
+	         texid, quadid, x, y, rot, sx, sy, ox, oy,
+	         rgba8(color.r), rgba8(color.g), rgba8(color.b), rgba8(color.a));
+	rows().push_back(buf);
+}
+
+void capture_print(love::uint32 fontid, const std::string &text, float x, float y,
+                   float rot, float sx, float sy, const love::Colorf &color)
+{
+	char buf[512];
+	snprintf(buf, sizeof(buf),
+	         "print %u \"%s\" %.6f %.6f %.6f %.6f %.6f %d %d %d %d",
+	         fontid, esc(text).c_str(), x, y, rot, sx, sy,
+	         rgba8(color.r), rgba8(color.g), rgba8(color.b), rgba8(color.a));
+	rows().push_back(buf);
+}
+
+void capture_rect(love::uint8 mode, float x, float y, float w, float h, float rx,
+                  float ry, float width, const love::Colorf &color)
+{
+	char buf[256];
+	snprintf(buf, sizeof(buf),
+	         "rect %u %.6f %.6f %.6f %.6f %.6f %.6f %.6f %d %d %d %d",
+	         (unsigned) mode, x, y, w, h, rx, ry, width,
+	         rgba8(color.r), rgba8(color.g), rgba8(color.b), rgba8(color.a));
+	rows().push_back(buf);
+}
+
+// ------------------------------------------------------------------
+// 资产登记表 + 资产代理（语义替代四件套）
+// ------------------------------------------------------------------
+
+struct FrAsset
+{
+	int kind = 0;
+	love::uint32 id = 0;
+	int w = 0, h = 0;                 // image / canvas
+	float size = 0.0f;                // font
+	float qx = 0, qy = 0, qw = 0, qh = 0, qsw = 0, qsh = 0; // quad
+	std::string data_hex;             // image / font（空 = "-"）
+};
+
+static std::vector<FrAsset> &assets()
+{
+	static std::vector<FrAsset> a;
+	return a;
+}
+
+static love::uint32 next_asset_id()
+{
+	static love::uint32 id = 0;
+	return ++id; // 资产号自 1 起（0 = 空资产哨兵）
+}
+
+static const char *kind_name(int kind)
+{
+	static const char *names[] = { "image", "canvas", "quad", "font" };
+	return names[kind];
+}
+
+// fr.render_asset 同构（资产行文本，登记序入 asset_rows）。
+static std::string render_asset_row(const FrAsset &a)
+{
+	char buf[128];
+	if (a.kind == FR_ASSET_CANVAS)
+		snprintf(buf, sizeof(buf), "asset canvas %u %d %d", a.id, a.w, a.h);
+	else if (a.kind == FR_ASSET_QUAD)
+		snprintf(buf, sizeof(buf), "asset quad %u %.6f %.6f %.6f %.6f %.6f %.6f",
+		         a.id, a.qx, a.qy, a.qw, a.qh, a.qsw, a.qsh);
+	else if (a.kind == FR_ASSET_IMAGE)
+		snprintf(buf, sizeof(buf), "asset image %u %d %d %s",
+		         a.id, a.w, a.h, a.data_hex.empty() ? "-" : a.data_hex.c_str());
+	else
+		snprintf(buf, sizeof(buf), "asset font %u %.6f %s",
+		         a.id, a.size, a.data_hex.empty() ? "-" : a.data_hex.c_str());
+	return buf;
+}
+
+// 资产代理：full userdata + 专属元表（11.5 wrap 惯例同构；弃 lightuserdata
+// 方案的理由见 fr_capture.h）。载荷 {id, kind} 两字段只读。
+struct FrProxy
+{
+	love::uint32 id;
+	int kind;
+};
+
+static int proxy_index(lua_State *L)
+{
+	FrProxy *p = (FrProxy *) lua_touserdata(L, 1);
+	const char *k = luaL_checkstring(L, 2);
+	if (strcmp(k, "id") == 0)
+	{
+		lua_pushinteger(L, (lua_Integer) p->id);
+		return 1;
+	}
+	if (strcmp(k, "kind") == 0)
+	{
+		lua_pushinteger(L, p->kind);
+		return 1;
+	}
+	return luaL_error(L, "fr.asset proxy: 未知字段 \"%s\"（可用 id/kind）", k);
+}
+
+static int proxy_tostring(lua_State *L)
+{
+	FrProxy *p = (FrProxy *) lua_touserdata(L, 1);
+	lua_pushfstring(L, "fr.asset(id=%u, kind=%s)", p->id, kind_name(p->kind));
+	return 1;
+}
+
+static void push_proxy(lua_State *L, const FrAsset &a)
+{
+	if (luaL_newmetatable(L, "fr_asset_proxy"))
+	{
+		lua_pushcfunction(L, proxy_index);
+		lua_setfield(L, -2, "__index");
+		lua_pushcfunction(L, proxy_tostring);
+		lua_setfield(L, -2, "__tostring");
+	}
+	lua_pop(L, 1);
+
+	FrProxy *p = (FrProxy *) lua_newuserdata(L, sizeof(FrProxy));
+	p->id = a.id;
+	p->kind = a.kind;
+	luaL_getmetatable(L, "fr_asset_proxy");
+	lua_setmetatable(L, -2);
+}
+
+bool fr_isasset(lua_State *L, int idx)
+{
+	if (lua_type(L, idx) != LUA_TUSERDATA)
+		return false;
+	if (lua_getmetatable(L, idx) == 0)
+		return false;
+	luaL_getmetatable(L, "fr_asset_proxy");
+	bool same = lua_rawequal(L, -1, -2) != 0;
+	lua_pop(L, 2);
+	return same;
+}
+
+love::uint32 fr_assetid(lua_State *L, int idx)
+{
+	FrProxy *p = (FrProxy *) lua_touserdata(L, idx);
+	return p != nullptr ? p->id : 0;
+}
+
+static love::uint32 register_asset(const FrAsset &a)
+{
+	assets().push_back(a);
+	asset_rows().push_back(render_asset_row(a));
+	return a.id;
+}
+
+// ------------------------------------------------------------------
+// 语义替代四件套（w_new* 挂钩转入）
+// ------------------------------------------------------------------
+
+int w_frNewImage(lua_State *L)
+{
+	FrAsset a;
+	a.kind = FR_ASSET_IMAGE;
+
+	if (lua_type(L, 1) == LUA_TSTRING)
+	{
+		// 文件路径：读真实字节登记（假数据模式不适用——有真文件字节）。
+		// 宽高 demo 期无真解码登记 0（占位渲染不可见；真解码归 B4 阶段三）。
+		const char *filename = luaL_checkstring(L, 1);
+		love::filesystem::Filesystem *fs =
+			love::Module::getInstance<love::filesystem::Filesystem>(love::Module::M_FILESYSTEM);
+		if (fs == nullptr)
+			return luaL_error(L, "fr.newImage: filesystem 未初始化");
+
+		love::filesystem::FileData *data = nullptr;
+		love::luax_catchexcept(L, [&]() { data = fs->read(filename); });
+
+		size_t n = data->getSize();
+		const love::uint8 *bytes = (const love::uint8 *) data->getData();
+		static const char *hexd = "0123456789abcdef";
+		a.data_hex.reserve(n * 2);
+		for (size_t i = 0; i < n; i++)
+		{
+			a.data_hex += hexd[bytes[i] >> 4];
+			a.data_hex += hexd[bytes[i] & 0xF];
+		}
+		data->release();
+	}
+	else
+	{
+		// ImageData 路径：data_hex 假数据模式（L0 口径，demo 期无真解码）。
+		love::image::ImageData *d = love::luax_checktype<love::image::ImageData>(L, 1);
+		a.w = d->getWidth();
+		a.h = d->getHeight();
+	}
+
+	a.id = next_asset_id();
+	register_asset(a);
+	push_proxy(L, a);
+	return 1;
+}
+
+int w_frNewFont(lua_State *L)
+{
+	// demo 边界：仅 newFont(size) 形态（文件/Rasterizer 形态需真解码，阶段三）。
+	if (lua_type(L, 1) != LUA_TNUMBER)
+		return luaL_error(L, "fr.newFont: 语义替代仅支持 newFont(size) 形态（B4 demo 边界）");
+
+	FrAsset a;
+	a.kind = FR_ASSET_FONT;
+	a.size = (float) luaL_checknumber(L, 1);
+	a.id = next_asset_id();
+	register_asset(a);
+	push_proxy(L, a);
+	return 1;
+}
+
+int w_frNewCanvas(lua_State *L)
+{
+	FrAsset a;
+	a.kind = FR_ASSET_CANVAS;
+	a.w = (int) luaL_checkinteger(L, 1);
+	a.h = (int) luaL_checkinteger(L, 2);
+	// 不建真 Canvas（文件头 Canvas 边界：回读 rig 走 _frNewCanvasReal）。
+	a.id = next_asset_id();
+	register_asset(a);
+	push_proxy(L, a);
+	return 1;
+}
+
+int w_frNewQuad(lua_State *L)
+{
+	FrAsset a;
+	a.kind = FR_ASSET_QUAD;
+	a.qx = (float) luaL_checknumber(L, 1);
+	a.qy = (float) luaL_checknumber(L, 2);
+	a.qw = (float) luaL_checknumber(L, 3);
+	a.qh = (float) luaL_checknumber(L, 4);
+	a.qsw = (float) luaL_checknumber(L, 5);
+	a.qsh = (float) luaL_checknumber(L, 6);
+	a.id = next_asset_id();
+	register_asset(a);
+	push_proxy(L, a);
+	return 1;
+}
+
+// ------------------------------------------------------------------
+// 回放（present 钩 / _frReplay 入口）
+// ------------------------------------------------------------------
+
+// 占位伪色映射（id → 确定性颜色；1→白 2→青 其它→灰，见 fr_capture.h）。
+static love::Colorf pseudocolor(love::uint32 id)
+{
+	switch (id)
+	{
+	case 1: return love::Colorf(1.0f, 1.0f, 1.0f, 1.0f);
+	case 2: return love::Colorf(0.0f, 1.0f, 1.0f, 1.0f);
+	default: return love::Colorf(0.5f, 0.5f, 0.5f, 1.0f);
+	}
+}
+
+static void lookup_asset_size(love::uint32 id, int &w, int &h)
+{
+	w = 0;
+	h = 0;
+	for (const FrAsset &a : assets())
+	{
+		if (a.id == id && (a.kind == FR_ASSET_IMAGE || a.kind == FR_ASSET_CANVAS))
+		{
+			w = a.w;
+			h = a.h;
+			return;
+		}
+	}
+}
+
 void capture_replay(love::graphics::Graphics *gfx)
 {
 	if (gfx == nullptr)
@@ -83,19 +406,77 @@ void capture_replay(love::graphics::Graphics *gfx)
 				gfx->clear(love::graphics::OptionalColorf(cf), love::OptionalInt(0), love::OptionalDouble(1.0));
 			}
 		}
-
-		// 其它 op（draw/print/rect/...）：Task 3 扩展。
+		else if (row.compare(0, 5, "draw ") == 0)
+		{
+			// 占位渲染：代理无真纹理，id→伪色矩形（尺寸=登记宽高；quad≠0 也按
+			// 整图占位——视口裁剪归阶段三，见 fr_capture.h）。坐标为捕获时结算
+			// 的世界系直通值（回放时变换栈恒 origin，无二次变换）。
+			unsigned tex = 0, quad = 0;
+			float x = 0, y = 0, rot = 0, sx = 0, sy = 0, ox = 0, oy = 0;
+			int r = 0, g = 0, b = 0, a = 255;
+			if (sscanf(row.c_str(), "draw %u %u %f %f %f %f %f %f %f %d %d %d %d",
+			           &tex, &quad, &x, &y, &rot, &sx, &sy, &ox, &oy, &r, &g, &b, &a) == 13)
+			{
+				gfx->setColor(pseudocolor(tex));
+				int w = 0, h = 0;
+				lookup_asset_size(tex, w, h);
+				if (w > 0 && h > 0)
+					gfx->rectangle(love::graphics::Graphics::DRAW_FILL, x, y, (float) w, (float) h);
+			}
+		}
+		else if (row.compare(0, 6, "print ") == 0)
+		{
+			// 占位渲染：font id→伪色小矩形（8x16 每字符），非真字形。
+			unsigned font = 0;
+			char text[256] = "";
+			float x = 0, y = 0, rot = 0, sx = 0, sy = 0;
+			int r = 0, g = 0, b = 0, a = 255;
+			if (sscanf(row.c_str(), "print %u \"%255[^\"]\" %f %f %f %f %f %d %d %d %d",
+			           &font, text, &x, &y, &rot, &sx, &sy, &r, &g, &b, &a) == 11)
+			{
+				gfx->setColor(pseudocolor(font));
+				gfx->rectangle(love::graphics::Graphics::DRAW_FILL, x, y,
+				               8.0f * (float) strlen(text), 16.0f);
+			}
+		}
+		else if (row.compare(0, 5, "rect ") == 0)
+		{
+			unsigned mode = 0;
+			float x = 0, y = 0, w = 0, h = 0, rx = 0, ry = 0, width = 1.0f;
+			int r = 0, g = 0, b = 0, a = 255;
+			if (sscanf(row.c_str(), "rect %u %f %f %f %f %f %f %f %d %d %d %d",
+			           &mode, &x, &y, &w, &h, &rx, &ry, &width, &r, &g, &b, &a) == 12)
+			{
+				// cmd.tbl mode 0=fill 1=line；love 枚举 DRAW_LINE=0 DRAW_FILL=1——换算。
+				love::graphics::Graphics::DrawMode m =
+					(mode == 0) ? love::graphics::Graphics::DRAW_FILL
+					            : love::graphics::Graphics::DRAW_LINE;
+				gfx->setColor(love::Colorf(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f));
+				if (rx > 0.0f || ry > 0.0f)
+					gfx->rectangle(m, x, y, w, h, rx, ry); // 圆角 points 缺省（行内无此字段）
+				else
+					gfx->rectangle(m, x, y, w, h);
+			}
+		}
 	}
 }
+
+// ------------------------------------------------------------------
+// Lua 出口
+// ------------------------------------------------------------------
 
 std::vector<std::string> capture_take_rows()
 {
 	return rows();
 }
 
-int w_frTakeSession(lua_State *L)
+std::vector<std::string> fr_take_asset_rows()
 {
-	const std::vector<std::string> &rs = rows();
+	return asset_rows();
+}
+
+static int push_string_array(lua_State *L, const std::vector<std::string> &rs)
+{
 	lua_createtable(L, (int) rs.size(), 0);
 	for (size_t i = 0; i < rs.size(); i++)
 	{
@@ -105,12 +486,44 @@ int w_frTakeSession(lua_State *L)
 	return 1;
 }
 
+int w_frTakeSession(lua_State *L)
+{
+	return push_string_array(L, rows());
+}
+
+int w_frTakeAssets(lua_State *L)
+{
+	return push_string_array(L, asset_rows());
+}
+
 int w_frReplay(lua_State *)
 {
 	love::graphics::Graphics *gfx =
 		love::Module::getInstance<love::graphics::Graphics>(love::Module::M_GRAPHICS);
 	capture_replay(gfx);
 	return 0;
+}
+
+int w_frNewCanvasReal(lua_State *L)
+{
+	love::graphics::Graphics *gfx =
+		love::Module::getInstance<love::graphics::Graphics>(love::Module::M_GRAPHICS);
+	int w = (int) luaL_checkinteger(L, 1);
+	int h = (int) luaL_checkinteger(L, 2);
+
+	// 真 Canvas（开关无关）：验证帧回读 rig 专用。dpiScale=1 定死像素域 =
+	// 逻辑域（默认 getScreenDPIScale() 会随窗口 DPI 漂移，回读坐标失准）。
+	love::graphics::Canvas::Settings settings;
+	settings.width = w;
+	settings.height = h;
+	settings.dpiScale = 1.0f;
+
+	love::graphics::Canvas *canvas = nullptr;
+	love::luax_catchexcept(L, [&]() { canvas = gfx->newCanvas(settings); });
+
+	love::luax_pushtype(L, canvas);
+	canvas->release();
+	return 1;
 }
 
 } // fr
