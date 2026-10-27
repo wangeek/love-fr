@@ -11,7 +11,9 @@
 #include "common/runtime.h"
 #include "filesystem/Filesystem.h"
 #include "graphics/Canvas.h"
+#include "image/Image.h"
 #include "image/ImageData.h"
+#include "modules/graphics/fr/fr_codec.h"
 
 #include <cmath>
 #include <cstdio>
@@ -137,6 +139,49 @@ static std::string hex_encode(const void *bytes, size_t n)
 }
 
 // ------------------------------------------------------------------
+// 行文本渲染（捕获 emit 与拓扑 B 二进制解码重渲染共用——单一格式源，
+// fr-as/fr-dis 的 canonical 往返由根仓库回归守护）
+// ------------------------------------------------------------------
+
+static std::string render_clear_row(int r, int g, int b, int a)
+{
+	char buf[64];
+	snprintf(buf, sizeof(buf), "clear %d %d %d %d", r, g, b, a);
+	return buf;
+}
+
+static std::string render_draw_row(love::uint32 tex, love::uint32 quad, float x, float y,
+                                   float rot, float sx, float sy, float ox, float oy,
+                                   int r, int g, int b, int a)
+{
+	char buf[256];
+	snprintf(buf, sizeof(buf),
+	         "draw %u %u %.6f %.6f %.6f %.6f %.6f %.6f %.6f %d %d %d %d",
+	         tex, quad, x, y, rot, sx, sy, ox, oy, r, g, b, a);
+	return buf;
+}
+
+static std::string render_print_row(love::uint32 font, const std::string &text, float x, float y,
+                                    float rot, float sx, float sy, int r, int g, int b, int a)
+{
+	char buf[512];
+	snprintf(buf, sizeof(buf),
+	         "print %u \"%s\" %.6f %.6f %.6f %.6f %.6f %d %d %d %d",
+	         font, esc(text).c_str(), x, y, rot, sx, sy, r, g, b, a);
+	return buf;
+}
+
+static std::string render_rect_row(love::uint8 mode, float x, float y, float w, float h,
+                                   float rx, float ry, float width, int r, int g, int b, int a)
+{
+	char buf[256];
+	snprintf(buf, sizeof(buf),
+	         "rect %u %.6f %.6f %.6f %.6f %.6f %.6f %.6f %d %d %d %d",
+	         (unsigned) mode, x, y, w, h, rx, ry, width, r, g, b, a);
+	return buf;
+}
+
+// ------------------------------------------------------------------
 // 捕获点（clear + Task 3 draw/print/rect）
 // ------------------------------------------------------------------
 
@@ -158,44 +203,32 @@ void capture_clear(const love::graphics::OptionalColorf &color,
 	if (c == nullptr)
 		return; // 无颜色 clear（clear(false)/纯 stencil/depth）本批不产行
 
-	char buf[64];
-	snprintf(buf, sizeof(buf), "clear %d %d %d %d",
-	         rgba8(c->value.r), rgba8(c->value.g),
-	         rgba8(c->value.b), rgba8(c->value.a));
-	rows().push_back(buf);
+	rows().push_back(render_clear_row(rgba8(c->value.r), rgba8(c->value.g),
+	                                  rgba8(c->value.b), rgba8(c->value.a)));
 }
 
 void capture_draw(love::uint32 texid, love::uint32 quadid, float x, float y, float rot,
                   float sx, float sy, float ox, float oy, const love::Colorf &color)
 {
-	char buf[256];
-	snprintf(buf, sizeof(buf),
-	         "draw %u %u %.6f %.6f %.6f %.6f %.6f %.6f %.6f %d %d %d %d",
-	         texid, quadid, x, y, rot, sx, sy, ox, oy,
-	         rgba8(color.r), rgba8(color.g), rgba8(color.b), rgba8(color.a));
-	rows().push_back(buf);
+	rows().push_back(render_draw_row(texid, quadid, x, y, rot, sx, sy, ox, oy,
+	                                 rgba8(color.r), rgba8(color.g),
+	                                 rgba8(color.b), rgba8(color.a)));
 }
 
 void capture_print(love::uint32 fontid, const std::string &text, float x, float y,
                    float rot, float sx, float sy, const love::Colorf &color)
 {
-	char buf[512];
-	snprintf(buf, sizeof(buf),
-	         "print %u \"%s\" %.6f %.6f %.6f %.6f %.6f %d %d %d %d",
-	         fontid, esc(text).c_str(), x, y, rot, sx, sy,
-	         rgba8(color.r), rgba8(color.g), rgba8(color.b), rgba8(color.a));
-	rows().push_back(buf);
+	rows().push_back(render_print_row(fontid, text, x, y, rot, sx, sy,
+	                                  rgba8(color.r), rgba8(color.g),
+	                                  rgba8(color.b), rgba8(color.a)));
 }
 
 void capture_rect(love::uint8 mode, float x, float y, float w, float h, float rx,
                   float ry, float width, const love::Colorf &color)
 {
-	char buf[256];
-	snprintf(buf, sizeof(buf),
-	         "rect %u %.6f %.6f %.6f %.6f %.6f %.6f %.6f %d %d %d %d",
-	         (unsigned) mode, x, y, w, h, rx, ry, width,
-	         rgba8(color.r), rgba8(color.g), rgba8(color.b), rgba8(color.a));
-	rows().push_back(buf);
+	rows().push_back(render_rect_row(mode, x, y, w, h, rx, ry, width,
+	                                 rgba8(color.r), rgba8(color.g),
+	                                 rgba8(color.b), rgba8(color.a)));
 }
 
 // ------------------------------------------------------------------
@@ -346,6 +379,30 @@ bool fr_lookup_asset(love::uint32 id, FrAssetInfo &out)
 	return false;
 }
 
+// 流内资产登记（拓扑 B 离线回放）：id 取流行，不重编号；只入登记表
+//（物化器消费），不入 asset_rows（离线不回产会话文本）。
+bool fr_register_stream_asset(int kind, love::uint32 id, int w, int h, float size,
+                              const float *quad, const std::string &data_hex)
+{
+	if (id == 0)
+		return false; // 0 = 空资产哨兵，不可登记
+
+	FrAsset a;
+	a.kind = kind;
+	a.id = id;
+	a.w = w;
+	a.h = h;
+	a.size = size;
+	if (quad != nullptr)
+	{
+		a.qx = quad[0]; a.qy = quad[1]; a.qw = quad[2];
+		a.qh = quad[3]; a.qsw = quad[4]; a.qsh = quad[5];
+	}
+	a.data_hex = data_hex;
+	assets().push_back(a);
+	return true;
+}
+
 // ------------------------------------------------------------------
 // 语义替代四件套（w_new* 挂钩转入）
 // ------------------------------------------------------------------
@@ -436,7 +493,7 @@ int w_frNewQuad(lua_State *L)
 }
 
 // ------------------------------------------------------------------
-// 回放（present 钩 / _frReplay 入口）
+// 回放（present 钩 / _frReplay 入口 / 拓扑 B 离线回放共用行执行）
 // ------------------------------------------------------------------
 
 // 占位伪色映射（id → 确定性颜色；1→白 2→青 其它→灰，见 fr_capture.h）。
@@ -465,143 +522,151 @@ static void lookup_asset_size(love::uint32 id, int &w, int &h)
 	}
 }
 
+// 单行执行：.fr 行 = 空格分隔 token，首 token 为 op 名（golden/l0_session.fr
+// 同构）。tee₂（capture_replay）与拓扑 B 离线回放共用本入口——同一物化器、
+// 同一真渲染路径（B4-2 验收线第二分句的同构关键）。
+void capture_exec_row(love::graphics::Graphics *gfx, const std::string &row)
+{
+	if (gfx == nullptr)
+		return;
+
+	if (row.compare(0, 6, "clear ") == 0)
+	{
+		int r = 0, g = 0, b = 0, a = 255;
+		if (sscanf(row.c_str(), "clear %d %d %d %d", &r, &g, &b, &a) == 4)
+		{
+			love::Colorf cf(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+			// stencil/depth 按 w_clear 的缺省口径（0 / 1.0），见 fr_capture.h 边界。
+			gfx->clear(love::graphics::OptionalColorf(cf), love::OptionalInt(0), love::OptionalDouble(1.0));
+		}
+	}
+	else if (row.compare(0, 5, "draw ") == 0)
+	{
+		// 真纹理物化优先（B4 阶段三）：登记字节 → Image（fr_materialize，
+		// 会话内缓存），行内颜色 = 捕获时 setColor 状态（纹理色 × 画色）。
+		// quad≠0 仍走占位（Quad 视口裁剪归后续批次）；未登记/物化失败
+		// 回退伪色矩形（伪色按 id 确定性映射）。
+		unsigned tex = 0, quad = 0;
+		float x = 0, y = 0, rot = 0, sx = 0, sy = 0, ox = 0, oy = 0;
+		int r = 0, g = 0, b = 0, a = 255;
+		if (sscanf(row.c_str(), "draw %u %u %f %f %f %f %f %f %f %d %d %d %d",
+		           &tex, &quad, &x, &y, &rot, &sx, &sy, &ox, &oy, &r, &g, &b, &a) == 13)
+		{
+			love::graphics::Image *img =
+				(quad == 0) ? fr_materialize_image(gfx, tex) : nullptr;
+			if (img != nullptr)
+			{
+				// 裸参数矩阵重建（luax_checkstandardtransform 的
+				// Matrix4(x,y,a,sx,sy,ox,oy,kx,ky) 同构；x/y 已是捕获时
+				// 结算的世界系，回放变换栈恒 origin，无二次变换）。
+				love::Matrix4 m(x, y, rot, sx, sy, ox, oy, 0.0f, 0.0f);
+				gfx->setColor(love::Colorf(r / 255.0f, g / 255.0f,
+				                           b / 255.0f, a / 255.0f));
+				gfx->draw((love::graphics::Drawable *) img, m);
+			}
+			else
+			{
+				gfx->setColor(pseudocolor(tex));
+				int w = 0, h = 0;
+				lookup_asset_size(tex, w, h);
+				if (w > 0 && h > 0)
+					gfx->rectangle(love::graphics::Graphics::DRAW_FILL, x, y, (float) w, (float) h);
+			}
+		}
+	}
+	else if (row.compare(0, 6, "print ") == 0)
+	{
+		// 行解析（esc 反转义）：`print <font> "<escaped>" x y rot sx sy
+		// rgba`——手写引号扫描（sscanf %[^"] 会被转义 \" 截断），
+		// 引号内转义序列经 unesc 展开为原始字节。
+		unsigned font = 0;
+		float x = 0, y = 0, rot = 0, sx = 0, sy = 0;
+		int r = 0, g = 0, b = 0, a = 255;
+		std::string text;
+		bool parsed = false;
+
+		const char *p = row.c_str() + 6;
+		char *endp = nullptr;
+		font = (unsigned) strtoul(p, &endp, 10);
+		if (endp > p && endp[0] == ' ' && endp[1] == '"')
+		{
+			const char *q = endp + 2;
+			std::string raw;
+			while (*q != '\0')
+			{
+				if (*q == '\\' && q[1] != '\0')
+				{
+					raw += q[0];
+					raw += q[1];
+					q += 2;
+					continue;
+				}
+				if (*q == '"')
+					break;
+				raw += *q++;
+			}
+			if (*q == '"')
+			{
+				text = unesc(raw);
+				parsed = sscanf(q + 1, " %f %f %f %f %f %d %d %d %d",
+				                &x, &y, &rot, &sx, &sy, &r, &g, &b, &a) == 9;
+			}
+		}
+
+		if (parsed)
+		{
+			// 真字形优先（登记 Vera 字节 → Rasterizer → Font）；失败回退
+			// 伪色小矩形（8x16 每字符）。行内颜色 = 捕获时 setColor 状态
+			//（多段 ColoredString 已拼单串，段色不存——demo 单段）。
+			love::graphics::Font *fnt = fr_materialize_font(gfx, font);
+			if (fnt != nullptr)
+			{
+				love::Colorf cf(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+				gfx->setColor(cf);
+				std::vector<love::graphics::Font::ColoredString> str;
+				love::graphics::Font::ColoredString cs;
+				cs.str = text;
+				cs.color = cf;
+				str.push_back(cs);
+				love::Matrix4 m(x, y, rot, sx, sy, 0.0f, 0.0f, 0.0f, 0.0f);
+				gfx->print(str, fnt, m);
+			}
+			else
+			{
+				gfx->setColor(pseudocolor(font));
+				gfx->rectangle(love::graphics::Graphics::DRAW_FILL, x, y,
+				               8.0f * (float) text.size(), 16.0f);
+			}
+		}
+	}
+	else if (row.compare(0, 5, "rect ") == 0)
+	{
+		unsigned mode = 0;
+		float x = 0, y = 0, w = 0, h = 0, rx = 0, ry = 0, width = 1.0f;
+		int r = 0, g = 0, b = 0, a = 255;
+		if (sscanf(row.c_str(), "rect %u %f %f %f %f %f %f %f %d %d %d %d",
+		           &mode, &x, &y, &w, &h, &rx, &ry, &width, &r, &g, &b, &a) == 12)
+		{
+			// cmd.tbl mode 0=fill 1=line；love 枚举 DRAW_LINE=0 DRAW_FILL=1——换算。
+			love::graphics::Graphics::DrawMode m =
+				(mode == 0) ? love::graphics::Graphics::DRAW_FILL
+				            : love::graphics::Graphics::DRAW_LINE;
+			gfx->setColor(love::Colorf(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f));
+			if (rx > 0.0f || ry > 0.0f)
+				gfx->rectangle(m, x, y, w, h, rx, ry); // 圆角 points 缺省（行内无此字段）
+			else
+				gfx->rectangle(m, x, y, w, h);
+		}
+	}
+}
+
 void capture_replay(love::graphics::Graphics *gfx)
 {
 	if (gfx == nullptr)
 		return;
 
 	for (const std::string &row : rows())
-	{
-		// .fr 行 = 空格分隔 token，首 token 为 op 名（golden/l0_session.fr 同构）。
-		if (row.compare(0, 6, "clear ") == 0)
-		{
-			int r = 0, g = 0, b = 0, a = 255;
-			if (sscanf(row.c_str(), "clear %d %d %d %d", &r, &g, &b, &a) == 4)
-			{
-				love::Colorf cf(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
-				// stencil/depth 按 w_clear 的缺省口径（0 / 1.0），见 fr_capture.h 边界。
-				gfx->clear(love::graphics::OptionalColorf(cf), love::OptionalInt(0), love::OptionalDouble(1.0));
-			}
-		}
-		else if (row.compare(0, 5, "draw ") == 0)
-		{
-			// 真纹理物化优先（B4 阶段三）：登记字节 → Image（fr_materialize，
-			// 会话内缓存），行内颜色 = 捕获时 setColor 状态（纹理色 × 画色）。
-			// quad≠0 仍走占位（Quad 视口裁剪归后续批次）；未登记/物化失败
-			// 回退伪色矩形（伪色按 id 确定性映射）。
-			unsigned tex = 0, quad = 0;
-			float x = 0, y = 0, rot = 0, sx = 0, sy = 0, ox = 0, oy = 0;
-			int r = 0, g = 0, b = 0, a = 255;
-			if (sscanf(row.c_str(), "draw %u %u %f %f %f %f %f %f %f %d %d %d %d",
-			           &tex, &quad, &x, &y, &rot, &sx, &sy, &ox, &oy, &r, &g, &b, &a) == 13)
-			{
-				love::graphics::Image *img =
-					(quad == 0) ? fr_materialize_image(gfx, tex) : nullptr;
-				if (img != nullptr)
-				{
-					// 裸参数矩阵重建（luax_checkstandardtransform 的
-					// Matrix4(x,y,a,sx,sy,ox,oy,kx,ky) 同构；x/y 已是捕获时
-					// 结算的世界系，回放变换栈恒 origin，无二次变换）。
-					love::Matrix4 m(x, y, rot, sx, sy, ox, oy, 0.0f, 0.0f);
-					gfx->setColor(love::Colorf(r / 255.0f, g / 255.0f,
-					                           b / 255.0f, a / 255.0f));
-					gfx->draw((love::graphics::Drawable *) img, m);
-				}
-				else
-				{
-					gfx->setColor(pseudocolor(tex));
-					int w = 0, h = 0;
-					lookup_asset_size(tex, w, h);
-					if (w > 0 && h > 0)
-						gfx->rectangle(love::graphics::Graphics::DRAW_FILL, x, y, (float) w, (float) h);
-				}
-			}
-		}
-		else if (row.compare(0, 6, "print ") == 0)
-		{
-			// 行解析（esc 反转义）：`print <font> "<escaped>" x y rot sx sy
-			// rgba`——手写引号扫描（sscanf %[^"] 会被转义 \" 截断），
-			// 引号内转义序列经 unesc 展开为原始字节。
-			unsigned font = 0;
-			float x = 0, y = 0, rot = 0, sx = 0, sy = 0;
-			int r = 0, g = 0, b = 0, a = 255;
-			std::string text;
-			bool parsed = false;
-
-			const char *p = row.c_str() + 6;
-			char *endp = nullptr;
-			font = (unsigned) strtoul(p, &endp, 10);
-			if (endp > p && endp[0] == ' ' && endp[1] == '"')
-			{
-				const char *q = endp + 2;
-				std::string raw;
-				while (*q != '\0')
-				{
-					if (*q == '\\' && q[1] != '\0')
-					{
-						raw += q[0];
-						raw += q[1];
-						q += 2;
-						continue;
-					}
-					if (*q == '"')
-						break;
-					raw += *q++;
-				}
-				if (*q == '"')
-				{
-					text = unesc(raw);
-					parsed = sscanf(q + 1, " %f %f %f %f %f %d %d %d %d",
-					                &x, &y, &rot, &sx, &sy, &r, &g, &b, &a) == 9;
-				}
-			}
-
-			if (parsed)
-			{
-				// 真字形优先（登记 Vera 字节 → Rasterizer → Font）；失败回退
-				// 伪色小矩形（8x16 每字符）。行内颜色 = 捕获时 setColor 状态
-				//（多段 ColoredString 已拼单串，段色不存——demo 单段）。
-				love::graphics::Font *fnt = fr_materialize_font(gfx, font);
-				if (fnt != nullptr)
-				{
-					love::Colorf cf(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
-					gfx->setColor(cf);
-					std::vector<love::graphics::Font::ColoredString> str;
-					love::graphics::Font::ColoredString cs;
-					cs.str = text;
-					cs.color = cf;
-					str.push_back(cs);
-					love::Matrix4 m(x, y, rot, sx, sy, 0.0f, 0.0f, 0.0f, 0.0f);
-					gfx->print(str, fnt, m);
-				}
-				else
-				{
-					gfx->setColor(pseudocolor(font));
-					gfx->rectangle(love::graphics::Graphics::DRAW_FILL, x, y,
-					               8.0f * (float) text.size(), 16.0f);
-				}
-			}
-		}
-		else if (row.compare(0, 5, "rect ") == 0)
-		{
-			unsigned mode = 0;
-			float x = 0, y = 0, w = 0, h = 0, rx = 0, ry = 0, width = 1.0f;
-			int r = 0, g = 0, b = 0, a = 255;
-			if (sscanf(row.c_str(), "rect %u %f %f %f %f %f %f %f %d %d %d %d",
-			           &mode, &x, &y, &w, &h, &rx, &ry, &width, &r, &g, &b, &a) == 12)
-			{
-				// cmd.tbl mode 0=fill 1=line；love 枚举 DRAW_LINE=0 DRAW_FILL=1——换算。
-				love::graphics::Graphics::DrawMode m =
-					(mode == 0) ? love::graphics::Graphics::DRAW_FILL
-					            : love::graphics::Graphics::DRAW_LINE;
-				gfx->setColor(love::Colorf(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f));
-				if (rx > 0.0f || ry > 0.0f)
-					gfx->rectangle(m, x, y, w, h, rx, ry); // 圆角 points 缺省（行内无此字段）
-				else
-					gfx->rectangle(m, x, y, w, h);
-			}
-		}
-	}
+		capture_exec_row(gfx, row);
 }
 
 // ------------------------------------------------------------------
@@ -666,6 +731,504 @@ int w_frNewCanvasReal(lua_State *L)
 
 	love::luax_pushtype(L, canvas);
 	canvas->release();
+	return 1;
+}
+
+// ------------------------------------------------------------------
+// 拓扑 B 离线回放 + D_CRC 采集（B4 阶段三 Task 3）
+// ------------------------------------------------------------------
+
+// CRC32（l0/walker.lua 同构：查表 0xEDB88320、init/xorout 0xFFFFFFFF、
+// reflected；空输入 = 0）。live 验证帧（w_frImageDataCRC）与离线回放
+// 共用本函数——对拍锚的"同采集函数"。
+static love::uint32 crc32_bytes(const void *data, size_t n)
+{
+	static love::uint32 table[256];
+	static bool ready = []()
+	{
+		for (int i = 0; i < 256; i++)
+		{
+			love::uint32 c = (love::uint32) i;
+			for (int k = 0; k < 8; k++)
+				c = (c & 1u) ? (c >> 1) ^ 0xEDB88320u : (c >> 1);
+			table[i] = c;
+		}
+		return true;
+	}();
+	(void) ready;
+
+	const love::uint8 *p = (const love::uint8 *) data;
+	love::uint32 crc = 0xFFFFFFFFu;
+	for (size_t i = 0; i < n; i++)
+		crc = (crc >> 8) ^ table[(crc ^ p[i]) & 0xFFu];
+	return crc ^ 0xFFFFFFFFu;
+}
+
+// 离线会话：头几何 + 每帧 out 行（资产在解析期直接入登记表）。
+struct OfflineSession
+{
+	int width = 640, height = 480;
+	std::vector<std::vector<std::string>> frames;
+};
+
+static bool hex_valid(const std::string &s)
+{
+	if (s.empty())
+		return true; // 空 = "-" 占位
+	for (char c : s)
+	{
+		bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+		if (!ok)
+			return false;
+	}
+	return true;
+}
+
+// 资产行（文本形态）→ 登记。"asset image <id> <w> <h> <hex|->" /
+// "asset canvas <id> <w> <h>" / "asset quad <id> %.6f×6" /
+// "asset font <id> <size> <hex|->"（render_asset_row 同构）。
+static int offline_register_asset_text(const std::string &row, int lineno)
+{
+	unsigned id = 0;
+	int w = 0, h = 0, pos = 0;
+	float size = 0.0f;
+	float q[6] = {0, 0, 0, 0, 0, 0};
+	std::string hex;
+
+	if (sscanf(row.c_str(), "asset image %u %d %d %n", &id, &w, &h, &pos) == 3)
+	{
+		hex = row.substr((size_t) pos);
+		if (hex == "-")
+			hex.clear();
+		if (!hex_valid(hex))
+			return 0;
+		return fr_register_stream_asset(FR_ASSET_IMAGE, id, w, h, 0.0f, nullptr, hex) ? 1 : 0;
+	}
+	if (sscanf(row.c_str(), "asset canvas %u %d %d", &id, &w, &h) == 3)
+		return fr_register_stream_asset(FR_ASSET_CANVAS, id, w, h, 0.0f, nullptr, "") ? 1 : 0;
+	if (sscanf(row.c_str(), "asset quad %u %f %f %f %f %f %f",
+	           &id, &q[0], &q[1], &q[2], &q[3], &q[4], &q[5]) == 7)
+		return fr_register_stream_asset(FR_ASSET_QUAD, id, 0, 0, 0.0f, q, "") ? 1 : 0;
+	if (sscanf(row.c_str(), "asset font %u %f %n", &id, &size, &pos) == 2)
+	{
+		hex = row.substr((size_t) pos);
+		if (hex == "-")
+			hex.clear();
+		if (!hex_valid(hex))
+			return 0;
+		return fr_register_stream_asset(FR_ASSET_FONT, id, 0, 0, size, nullptr, hex) ? 1 : 0;
+	}
+	(void) lineno;
+	return 0;
+}
+
+// 文本（.fr canonical）→ 会话。结构口径对齐 tools/fr_session.parse_text
+//（行号 1 起报错；行必须位于 frame 块内；帧号连续）。out 行只收本层执行
+// 域（clear/draw/print/rect），dt/cmnt 跳过——fr_check 已保证 canonical。
+static int offline_parse_text(const std::string &buf, OfflineSession &s)
+{
+	if (buf.empty() || buf.back() != '\n')
+	{
+		std::fprintf(stderr, "fr-offline: 第 1 行：文本必须以单个 LF 结尾\n");
+		return 3;
+	}
+
+	std::vector<std::string> lines;
+	size_t start = 0;
+	while (start < buf.size())
+	{
+		size_t end = buf.find('\n', start);
+		lines.push_back(buf.substr(start, end - start));
+		start = end + 1;
+	}
+
+	int w = 0, h = 0;
+	if (lines.empty() || sscanf(lines[0].c_str(), "frb1 %d %d", &w, &h) != 2
+	    || w <= 0 || h <= 0)
+	{
+		std::fprintf(stderr, "fr-offline: 第 1 行：会话头必须为 'frb1 w h sha loglvl seed'\n");
+		return 3;
+	}
+	s.width = w;
+	s.height = h;
+
+	bool in_frame = false;
+	for (size_t i = 1; i < lines.size(); i++)
+	{
+		const std::string &ln = lines[i];
+		int no = (int) i + 1;
+		if (ln.empty() || ln.find_first_not_of(" \t") == std::string::npos)
+		{
+			std::fprintf(stderr, "fr-offline: 第 %d 行：空行禁入 canonical\n", no);
+			return 3;
+		}
+		if (ln.compare(0, 5, "cmnt ") == 0)
+		{
+			in_frame = false;
+			continue;
+		}
+		if (ln.compare(0, 6, "frame ") == 0)
+		{
+			unsigned n = 0;
+			if (sscanf(ln.c_str(), "frame %u", &n) != 1 || n != s.frames.size())
+			{
+				std::fprintf(stderr, "fr-offline: 第 %d 行：帧号必须为 %d（连续）\n",
+				             no, (int) s.frames.size());
+				return 3;
+			}
+			s.frames.push_back(std::vector<std::string>());
+			in_frame = true;
+			continue;
+		}
+		if (!in_frame)
+		{
+			std::fprintf(stderr, "fr-offline: 第 %d 行：行必须位于 frame 块内\n", no);
+			return 3;
+		}
+		if (ln.compare(0, 3, "dt ") == 0)
+			continue; // 离线无 kernel，dt 只跳过
+		if (ln.compare(0, 6, "asset ") == 0)
+		{
+			if (!offline_register_asset_text(ln, no))
+			{
+				std::fprintf(stderr, "fr-offline: 第 %d 行：资产行非法\n", no);
+				return 3;
+			}
+			continue;
+		}
+		if (ln.compare(0, 6, "clear ") == 0 || ln.compare(0, 5, "draw ") == 0
+		    || ln.compare(0, 6, "print ") == 0 || ln.compare(0, 5, "rect ") == 0)
+		{
+			s.frames.back().push_back(ln);
+			continue;
+		}
+		std::fprintf(stderr, "fr-offline: 第 %d 行：离线回放不支持的非 out 行（B4 op 域）\n", no);
+		return 3;
+	}
+	return 0;
+}
+
+// 帧体（二进制）→ 会话：fr_dec 游标逐行解码；资产直接登记，out 行重渲染
+// 为 canonical 文本走 capture_exec_row（与 tee₂ 文本路径同一执行入口）。
+// base = 帧体在文件中的起始偏移（错误信息换算绝对偏移用）。
+static int offline_parse_frame_body(const love::uint8 *body, size_t n, size_t base,
+                                    std::vector<std::string> &out_rows)
+{
+	fr_dec d;
+	fr_dec_init(&d, body, n);
+	for (;;)
+	{
+		int r = fr_dec_next(&d);
+		if (r == 0)
+			break;
+		if (r < 0)
+		{
+			std::fprintf(stderr, "fr-offline: off %d：行解码失败（码 %d）\n",
+			             (int) (base + d.err_off), d.err);
+			return 3;
+		}
+
+		char text[512];
+		switch (d.op)
+		{
+		case FR_OP_DT:
+			(void) fr_dec_f32(&d); // 无 kernel，dt 只消费
+			break;
+		case FR_OP_ASSET:
+			if (d.asset_kind == FR_ASSET_KIND_IMAGE)
+			{
+				love::uint32 id = fr_dec_u32(&d), w = fr_dec_u32(&d), h = fr_dec_u32(&d);
+				(void) fr_dec_u32(&d); // data 长度（pending_len 供 fr_dec_data）
+				const love::uint8 *p = nullptr;
+				love::uint32 len = 0;
+				if (fr_dec_data(&d, &p, &len) != 0)
+					break;
+				fr_register_stream_asset(FR_ASSET_IMAGE, id, (int) w, (int) h, 0.0f,
+				                         nullptr, hex_encode(p, len));
+			}
+			else if (d.asset_kind == FR_ASSET_KIND_CANVAS)
+			{
+				love::uint32 id = fr_dec_u32(&d), w = fr_dec_u32(&d), h = fr_dec_u32(&d);
+				fr_register_stream_asset(FR_ASSET_CANVAS, id, (int) w, (int) h, 0.0f,
+				                         nullptr, "");
+			}
+			else if (d.asset_kind == FR_ASSET_KIND_QUAD)
+			{
+				love::uint32 id = fr_dec_u32(&d);
+				float q[6];
+				for (int k = 0; k < 6; k++)
+					q[k] = fr_dec_f32(&d);
+				fr_register_stream_asset(FR_ASSET_QUAD, id, 0, 0, 0.0f, q, "");
+			}
+			else if (d.asset_kind == FR_ASSET_KIND_FONT)
+			{
+				love::uint32 id = fr_dec_u32(&d);
+				float size = fr_dec_f32(&d);
+				(void) fr_dec_u32(&d); // data 长度
+				const love::uint8 *p = nullptr;
+				love::uint32 len = 0;
+				if (fr_dec_data(&d, &p, &len) != 0)
+					break;
+				fr_register_stream_asset(FR_ASSET_FONT, id, 0, 0, size,
+				                         nullptr, hex_encode(p, len));
+			}
+			else
+			{
+				std::fprintf(stderr, "fr-offline: off %d：asset kind 非法 %d\n",
+				             (int) (base + d.off), (int) d.asset_kind);
+				return 3;
+			}
+			break;
+		case FR_OP_CLEAR:
+		{
+			fr_rgba8 c;
+			if (fr_dec_rgba8(&d, &c) != 0)
+				break;
+			out_rows.push_back(render_clear_row(c.r, c.g, c.b, c.a));
+			break;
+		}
+		case FR_OP_DRAW:
+		{
+			love::uint32 tex = fr_dec_u32(&d), quad = fr_dec_u32(&d);
+			float x = fr_dec_f32(&d), y = fr_dec_f32(&d), rot = fr_dec_f32(&d);
+			float sx = fr_dec_f32(&d), sy = fr_dec_f32(&d);
+			float ox = fr_dec_f32(&d), oy = fr_dec_f32(&d);
+			fr_rgba8 c;
+			if (fr_dec_rgba8(&d, &c) != 0)
+				break;
+			out_rows.push_back(render_draw_row(tex, quad, x, y, rot, sx, sy, ox, oy,
+			                                   c.r, c.g, c.b, c.a));
+			break;
+		}
+		case FR_OP_PRINT:
+		{
+			love::uint32 font = fr_dec_u32(&d);
+			if (fr_dec_str(&d, text, sizeof(text)) != 0)
+				break;
+			float x = fr_dec_f32(&d), y = fr_dec_f32(&d), rot = fr_dec_f32(&d);
+			float sx = fr_dec_f32(&d), sy = fr_dec_f32(&d);
+			fr_rgba8 c;
+			if (fr_dec_rgba8(&d, &c) != 0)
+				break;
+			out_rows.push_back(render_print_row(font, std::string(text), x, y, rot,
+			                                    sx, sy, c.r, c.g, c.b, c.a));
+			break;
+		}
+		case FR_OP_RECT:
+		{
+			love::uint8 mode = fr_dec_u8(&d);
+			float x = fr_dec_f32(&d), y = fr_dec_f32(&d), w = fr_dec_f32(&d);
+			float h = fr_dec_f32(&d), rx = fr_dec_f32(&d), ry = fr_dec_f32(&d);
+			float width = fr_dec_f32(&d);
+			fr_rgba8 c;
+			if (fr_dec_rgba8(&d, &c) != 0)
+				break;
+			out_rows.push_back(render_rect_row(mode, x, y, w, h, rx, ry, width,
+			                                   c.r, c.g, c.b, c.a));
+			break;
+		}
+		default:
+			std::fprintf(stderr, "fr-offline: off %d：离线回放不支持的非 out 行 "
+			             "opcode 0x%02X（B4 op 域）\n", (int) (base + d.off - 1), d.op);
+			return 3;
+		}
+
+		if (d.err)
+		{
+			std::fprintf(stderr, "fr-offline: off %d：行字段解码失败（码 %d）\n",
+			             (int) (base + d.err_off), d.err);
+			return 3;
+		}
+	}
+	return 0;
+}
+
+// 二进制（.frb，小端）→ 会话。容器口径对齐 tools/fr_session.parse_binary：
+// 头 50B（FRB1 + ver + w/h u16 + sha 32B + loglvl + seed u64）+ entries
+//（tag 0xFF cmnt / 0x01 frame，各带 u32 长度前缀）；错误含偏移（0 起计）。
+// 行级解码走 fr_dec（fr-gen 生成物）——本层不手写行编解码。
+static int offline_parse_binary(const std::string &buf, OfflineSession &s)
+{
+	static const size_t HEADER_LEN = 50;
+	if (buf.size() < HEADER_LEN)
+	{
+		std::fprintf(stderr, "fr-offline: off 0：头部截断（需 %d 字节，得 %d）\n",
+		             (int) HEADER_LEN, (int) buf.size());
+		return 3;
+	}
+	if ((love::uint8) buf[4] != 1)
+	{
+		std::fprintf(stderr, "fr-offline: off 4：版本不支持 %d\n", (int) (love::uint8) buf[4]);
+		return 3;
+	}
+	love::uint32 w = (love::uint32) (love::uint8) buf[5]
+	                | ((love::uint32) (love::uint8) buf[6] << 8);
+	love::uint32 h = (love::uint32) (love::uint8) buf[7]
+	                | ((love::uint32) (love::uint8) buf[8] << 8);
+	s.width = (int) w;
+	s.height = (int) h;
+
+	const love::uint8 *p = (const love::uint8 *) buf.data();
+	size_t len = buf.size(), off = HEADER_LEN;
+	while (off < len)
+	{
+		love::uint8 tag = p[off];
+		off++;
+		if (off + 4 > len)
+		{
+			std::fprintf(stderr, "fr-offline: off %d：entry 长度截断\n", (int) off);
+			return 3;
+		}
+		love::uint32 n = (love::uint32) p[off] | ((love::uint32) p[off + 1] << 8)
+		               | ((love::uint32) p[off + 2] << 16) | ((love::uint32) p[off + 3] << 24);
+		off += 4;
+		if (n > (love::uint32) (len - off))
+		{
+			std::fprintf(stderr, "fr-offline: off %d：entry 截断（需 %d 字节，余 %d）\n",
+			             (int) off, (int) n, (int) (len - off));
+			return 3;
+		}
+		if (tag == 0xFF)
+		{
+			off += n; // cmnt：离线无消费，跳过
+			continue;
+		}
+		if (tag != 0x01)
+		{
+			std::fprintf(stderr, "fr-offline: off %d：entry tag 非法 0x%02X\n",
+			             (int) (off - 5), (int) tag);
+			return 3;
+		}
+		s.frames.push_back(std::vector<std::string>());
+		int rc = offline_parse_frame_body(p + off, n, off, s.frames.back());
+		off += n;
+		if (rc != 0)
+			return rc;
+	}
+	return 0;
+}
+
+int fr_offline_replay(const char *path, love::graphics::Graphics *gfx)
+{
+	if (gfx == nullptr)
+	{
+		std::fprintf(stderr, "fr-offline: graphics 模块缺席\n");
+		return 2;
+	}
+
+	FILE *f = std::fopen(path, "rb");
+	if (f == nullptr)
+	{
+		std::fprintf(stderr, "fr-offline: 打不开流文件 %s\n", path);
+		return 2;
+	}
+	std::string buf;
+	char chunk[65536];
+	size_t n;
+	while ((n = std::fread(chunk, 1, sizeof(chunk), f)) > 0)
+		buf.append(chunk, n);
+	bool io_err = std::ferror(f) != 0;
+	std::fclose(f);
+	if (io_err)
+	{
+		std::fprintf(stderr, "fr-offline: 读流文件失败 %s\n", path);
+		return 2;
+	}
+
+	OfflineSession s;
+	int rc = (buf.size() >= 4 && buf.compare(0, 4, "FRB1") == 0)
+	             ? offline_parse_binary(buf, s)
+	             : offline_parse_text(buf, s);
+	if (rc != 0)
+		return rc;
+	if (s.frames.empty())
+	{
+		std::fprintf(stderr, "fr-offline: 会话无帧\n");
+		return 3;
+	}
+
+	// 画布（_frNewCanvasReal 同款：会话头几何、dpiScale=1 定像素域）。
+	// 帧间不重建——行执行是累积语义（live 的 _frReplay 重放全会话行缓冲
+	// 与此同构；每帧块首 clear 保证帧内容独立性）。
+	love::graphics::Canvas::Settings settings;
+	settings.width = s.width;
+	settings.height = s.height;
+	settings.dpiScale = 1.0f;
+	love::graphics::Canvas *canvas = nullptr;
+	try
+	{
+		canvas = gfx->newCanvas(settings);
+	}
+	catch (love::Exception &e)
+	{
+		std::fprintf(stderr, "fr-offline: newCanvas 失败：%s\n", e.what());
+		return 2;
+	}
+
+	love::image::Image *imagemod =
+		love::Module::getInstance<love::image::Image>(love::Module::M_IMAGE);
+
+	for (size_t fi = 0; fi < s.frames.size(); fi++)
+	{
+		try
+		{
+			love::graphics::Graphics::RenderTargets rts;
+			rts.colors.emplace_back(canvas, 0);
+			gfx->setCanvas(rts);
+			for (const std::string &row : s.frames[fi])
+				capture_exec_row(gfx, row);
+			gfx->setCanvas(); // 解绑后再回读（active Canvas 不许 newImageData）
+
+			love::Rect rect = {0, 0, canvas->getPixelWidth(), canvas->getPixelHeight()};
+			love::image::ImageData *img = canvas->newImageData(imagemod, 0, 0, rect);
+
+			// D_CRC n = 前 n 个帧块执行后的画布 CRC（live 验证帧计数同口径：
+			// live 第 3 帧回读时行缓冲恰为前 3 帧块）。
+			std::printf("D_CRC %d %u\n", (int) fi + 1,
+			            crc32_bytes(img->getData(), img->getSize()));
+
+			if (fi + 1 == s.frames.size())
+			{
+				// 三采样像素（live 验证帧同点同换算：getPixel + floor(c*255+0.5)）
+				static const int pts[3][2] = {{400, 100}, {20, 30}, {320, 468}};
+				for (int k = 0; k < 3; k++)
+				{
+					love::Colorf c = img->getPixel(pts[k][0], pts[k][1]);
+					int r = (int) std::floor(c.r * 255.0f + 0.5f);
+					int g = (int) std::floor(c.g * 255.0f + 0.5f);
+					int b = (int) std::floor(c.b * 255.0f + 0.5f);
+					std::printf("PIXEL %d %d %d %d %d\n", pts[k][0], pts[k][1], r, g, b);
+				}
+			}
+			img->release();
+		}
+		catch (love::Exception &e)
+		{
+			gfx->setCanvas();
+			canvas->release();
+			std::fprintf(stderr, "fr-offline: 第 %d 帧回放失败：%s\n",
+			             (int) fi + 1, e.what());
+			return 2;
+		}
+	}
+	canvas->release();
+	std::fflush(stdout);
+	return 0;
+}
+
+int w_frImageDataCRC(lua_State *L)
+{
+	love::image::ImageData *img = love::luax_checktype<love::image::ImageData>(L, 1);
+	lua_pushinteger(L, (lua_Integer) crc32_bytes(img->getData(), img->getSize()));
+	return 1;
+}
+
+int w_frOfflineReplay(lua_State *L)
+{
+	const char *path = luaL_checkstring(L, 1);
+	love::graphics::Graphics *gfx =
+		love::Module::getInstance<love::graphics::Graphics>(love::Module::M_GRAPHICS);
+	lua_pushinteger(L, fr_offline_replay(path, gfx));
 	return 1;
 }
 

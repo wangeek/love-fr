@@ -6,6 +6,8 @@
 --                  到验证 Canvas；_frTakeSession/_frTakeAssets 有会话行。
 --   FR_CAPTURE 未设 真 clear/draw/print/rectangle 直接执行；回放缓冲为空
 --                  no-op；会话缓冲为空。
+-- 离线回放（B4 阶段三 Task 3）：--offline-replay <in.fr|.frb> 独占——不跑
+--                  kernel/run loop，C 入口读流回放采集 D_CRC 后直接退出。
 -- 资产等价基准（B4 阶段三口径）：红方块两版同色——捕获版 draw 回放经真纹理
 -- 物化（登记 ImageData 字节 → Image），真版 Image 由同一份红色 ImageData 建
 -- 真纹理。红条/背景为无资产 op，天然两版同色。
@@ -48,6 +50,23 @@ local function get_val(flag)
 		if a == flag then return args[i + 1] end
 	end
 	return nil
+end
+
+-- 拓扑 B 离线回放（B4 阶段三 Task 3）：--offline-replay <path> 独占模式——
+-- 不跑 kernel/run loop（也不吃 --out/--sha），main.lua 载入时 graphics 模块
+-- 已创建（boot.lua love.init 先 require("main")），直接调 C 入口：读流 →
+-- 逐帧 capture_exec_row 执行 → Canvas 回读 CRC 打印 D_CRC，跑完即退。
+local OFFLINE_PATH = get_val("--offline-replay")
+if OFFLINE_PATH then
+	local ok, rc = xpcall(love.graphics._frOfflineReplay, debug.traceback, OFFLINE_PATH)
+	io.stdout:flush()
+	if not ok then
+		io.stderr:write("fr-demo offline error:\n", tostring(rc), "\n")
+		io.stderr:flush()
+		os.exit(1)
+	end
+	os.exit(rc)
+	return
 end
 
 -- tee₁ 模式：--out 存在即启用；缺省 = 现行验证 rig（stdout 报告，不写文件）。
@@ -181,6 +200,10 @@ local function verify_frame()
 		if r == p[3] and g == p[4] and b == p[5] then npass = npass + 1 end
 	end
 	print(string.format("PIXELS %d %d", #pts, npass))
+	-- D_CRC（B4 阶段三 Task 3）：验证帧画布全字节 CRC32（_frImageDataCRC
+	-- 与离线回放同一 C 采集函数）——拓扑 B 对拍锚：离线回放同一流文件的
+	-- `D_CRC 3`（前 3 帧块执行后的画布）与本行同值。tee/非 tee 都打。
+	print(string.format("D_CRC %d %d", frame, love.graphics._frImageDataCRC(img)))
 	-- 会话行（测试判据）：资产行 + out 段行（clear/draw/print/rect）。
 	-- tee 模式不在此打印/退出：验证帧捕获行归本帧 delta，会话末统一组装写
 	-- 文件（Task 4：Canvas 回读与 tee 并存，先验证后 tee）。

@@ -3073,6 +3073,8 @@ static const luaL_Reg functions[] =
 	{ "_frTakeAssets", fr::w_frTakeAssets },
 	{ "_frReplay", fr::w_frReplay },
 	{ "_frNewCanvasReal", fr::w_frNewCanvasReal },
+	{ "_frImageDataCRC", fr::w_frImageDataCRC },
+	{ "_frOfflineReplay", fr::w_frOfflineReplay },
 
 	{ "newImage", w_newImage },
 	{ "newArrayImage", w_newArrayImage },

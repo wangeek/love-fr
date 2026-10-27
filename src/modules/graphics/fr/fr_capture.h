@@ -96,6 +96,10 @@ void capture_rect(love::uint8 mode, float x, float y, float w, float h, float rx
 // 方法，绕过 Lua 边界）。不消费缓冲。缓冲空 = no-op（开关关时安全可调）。
 void capture_replay(love::graphics::Graphics *gfx);
 
+// 单行执行（capture_replay 的 per-row 内核）：拓扑 B 离线回放与 tee₂ 回放
+// 共用同一行执行入口（物化器/真渲染同构的关键，B4 阶段三 Task 3）。
+void capture_exec_row(love::graphics::Graphics *gfx, const std::string &row);
+
 // out 段行文本（draw/print/rect/clear）。
 std::vector<std::string> capture_take_rows();
 // 资产行文本（登记序，Task 4 会话组装按 frame 0 checkpoint 注入）。
@@ -114,6 +118,20 @@ struct FrAssetInfo
 
 // 按 id 查登记资产（未登记 → false）。
 bool fr_lookup_asset(love::uint32 id, FrAssetInfo &out);
+
+// 流内资产登记（拓扑 B 离线回放用）：id 取流行（不重编号），只入登记表
+// 供物化器查表——不入 asset_rows（离线消费流，不回产会话文本）。
+// quad 可为 nullptr（非 quad 资产）；data_hex 空 = "-" 占位（物化不可用）。
+bool fr_register_stream_asset(int kind, love::uint32 id, int w, int h, float size,
+                              const float *quad, const std::string &data_hex);
+
+// 拓扑 B 离线回放（B4 阶段三 Task 3）：读 .fr/.frb 会话文件 → 逐帧经
+// capture_exec_row 执行（与 tee₂ 同一行执行路径）→ 每帧末真 Canvas 回读
+// ImageData → CRC32 → stdout 打印 `D_CRC <n> <crc>`（n = 已执行帧块数，
+// live 验证帧计数同口径）；末帧加三采样 PIXEL 行（live 验证帧同点同换算）。
+// 判 magic：FRB1 = 二进制（会话封装解包 + fr_dec 行解码），否则文本按行。
+// 返回 0 成功；非 0 = 错误（细节已写 stderr，含偏移 off / 行号）。
+int fr_offline_replay(const char *path, love::graphics::Graphics *gfx);
 
 // 语义替代四件套（w_new* 挂钩转入，开关开时生效）：
 //   newImage(filename|ImageData) → 登记真字节 hex（文件字节 / ImageData 像素）
@@ -136,10 +154,15 @@ love::uint32 fr_assetid(lua_State *L, int idx);
 //   love.graphics._frTakeAssets()  → 资产行文本数组；
 //   love.graphics._frReplay()      → 对当前 Graphics 实例回放一次；
 //   love.graphics._frNewCanvasReal(w, h) → 真 Canvas（开关无关；验证帧
-//       回读 rig 专用——语义替代版不建真 Canvas，见文件头 Canvas 边界）。
+//       回读 rig 专用——语义替代版不建真 Canvas，见文件头 Canvas 边界）；
+//   love.graphics._frImageDataCRC(img) → ImageData 全字节 CRC32（live
+//       验证帧 D_CRC 与离线回放同一采集函数，对拍锚）；
+//   love.graphics._frOfflineReplay(path) → fr_offline_replay 的 rc。
 int w_frTakeSession(lua_State *L);
 int w_frTakeAssets(lua_State *L);
 int w_frReplay(lua_State *L);
 int w_frNewCanvasReal(lua_State *L);
+int w_frImageDataCRC(lua_State *L);
+int w_frOfflineReplay(lua_State *L);
 
 } // fr
