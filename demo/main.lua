@@ -1,4 +1,4 @@
--- demo/main.lua —— B4-2 Task 3 捕获 rig（fork demo，Task 2 rig 的全帧扩展）。
+-- demo/main.lua —— B4-2 Task 4 捕获 rig（fork demo：Task 3 全帧捕获 + tee₁ 会话写出）。
 -- 两种模式同一条路径，开关只改变 C++ 侧行为（行为等价回归）：
 --   FR_CAPTURE=1   w_clear/draw/print/rectangle 抑制真执行只记行；构造四件套
 --                  （newImage/newFont/newCanvas/newQuad）走语义替代（资产登记
@@ -14,12 +14,87 @@
 --   _frReplay → 三点 getPixel 回读）→ draw → present。
 -- 官方骨架的两处省略（rig 口径，Task 2 实测记录）：
 --   - 不做 love.graphics.clear(getBackgroundColor()) 预清屏——它会混入捕获会话行；
---   - 不做 isActive 守卫——rig 只跑 3 帧即退出，窗口最小化非目标场景。
+--   - 不做 isActive 守卫——rig 只跑数帧即退出，窗口最小化非目标场景。
 -- dt 固定 0.016667（L0 golden 同源），hero.x 帧序 11.000020/12.000040/13.000060
 -- （10 + 60*dt*k，qf 域复算）——真实墙钟时间不定，会话行坐标不可锚定。
+--
+-- tee₁ 会话写出（Task 4）：--out <path> 存在即启用 tee 模式——会话末组装 .fr
+-- 文本写文件（UTF-8/LF，末尾单 LF）。组装口径复用 l0/main.lua 的成熟结构：
+-- 头行 `frb1 640 480 <sha> base <seed>` + cmnt 固定文本 + 帧块（帧内行序
+-- dt → 资产（仅 frame 0，checkpoint 注入口径）→ out（捕获行））。C 捕获层
+-- 当前不产 st/s_crc/d_crc 行（会话级校验归 B6 堆遍历）——**本会话为
+-- out-only 形态，end 段缺省**。参数：--frames N（缺省 4）、--sha <64hex>
+--（cmd.tbl 指纹，调用侧算好传入；缺/坏报错 exit 2，L0 同款）、--seed n
+--（缺省 0）。确定性：FIXED_DT 固定 + cmnt 固定 + 无随机 → 两次运行逐字节
+-- 一致（测试锚）。验证帧（frame 3）的 Canvas 回读与 tee 并存：先验证后 tee。
 local kernel = require("kernel")
 
 local FIXED_DT = 0.016667
+
+-- ------------------------------------------------------------------
+-- 参数解析（l0/main.lua 同款：arg[1]=游戏目录，游戏参数从 arg[2] 起）
+-- ------------------------------------------------------------------
+local args = {}
+if type(arg) == "table" then
+	local i = 2
+	while arg[i] ~= nil do
+		args[#args + 1] = arg[i]
+		i = i + 1
+	end
+end
+
+local function get_val(flag)
+	for i, a in ipairs(args) do
+		if a == flag then return args[i + 1] end
+	end
+	return nil
+end
+
+-- tee₁ 模式：--out 存在即启用；缺省 = 现行验证 rig（stdout 报告，不写文件）。
+local OUT_PATH = get_val("--out")
+local TEE = OUT_PATH ~= nil
+local FRAMES = 4
+local SHA, SEED = nil, 0
+
+if TEE then
+	local fv = get_val("--frames")
+	if fv ~= nil then
+		FRAMES = tonumber(fv)
+		if not FRAMES or FRAMES < 1 or math.floor(FRAMES) ~= FRAMES then
+			io.stderr:write("fr-demo: --frames 须为正整数\n")
+			os.exit(2)
+		end
+	end
+	SHA = get_val("--sha")
+	if not SHA or #SHA ~= 64 or SHA:find("[^0-9a-f]") then
+		io.stderr:write("fr-demo: tee 模式缺 --sha <64hex>（cmd.tbl 指纹，调用侧算好传入）\n")
+		os.exit(2)
+	end
+	local sv = get_val("--seed")
+	if sv ~= nil then
+		SEED = tonumber(sv)
+		if not SEED or SEED < 0 or math.floor(SEED) ~= SEED then
+			io.stderr:write("fr-demo: --seed 须为非负整数\n")
+			os.exit(2)
+		end
+	end
+end
+
+-- C 层会话缓冲全会话累积不消费（fr_capture.h：take 是拷贝）；帧界由 Lua 侧
+-- 按已取走行数切 delta——每帧的捕获行恰落在该帧 op 记录点之后（验证帧的
+-- Canvas 捕获也归该帧）。
+local taken = 0
+local frame_rows = {}                        -- frame_rows[f] = 第 f 帧的 out 行
+
+local function take_delta()
+	local all = love.graphics._frTakeSession()
+	local delta = {}
+	for i = taken + 1, #all do
+		delta[#delta + 1] = all[i]
+	end
+	taken = #all
+	return delta
+end
 
 -- IR 适配层：kernel 说 IR 语义（rgba8 0-255、mode 0=fill 1=line，cmd.tbl 口径），
 -- 翻译为 love.graphics 的 0-1 浮点 + 字符串 mode + setColor 状态折算。
@@ -102,13 +177,39 @@ local function verify_frame()
 		if r == p[3] and g == p[4] and b == p[5] then npass = npass + 1 end
 	end
 	print(string.format("PIXELS %d %d", #pts, npass))
-	-- 会话行（测试判据）：资产行 + out 段行（clear/draw/print/rect）
+	-- 会话行（测试判据）：资产行 + out 段行（clear/draw/print/rect）。
+	-- tee 模式不在此打印/退出：验证帧捕获行归本帧 delta，会话末统一组装写
+	-- 文件（Task 4：Canvas 回读与 tee 并存，先验证后 tee）。
+	if not TEE then
+		local assets = love.graphics._frTakeAssets()
+		for _, row in ipairs(assets) do print(row) end
+		local rows = love.graphics._frTakeSession()
+		for _, row in ipairs(rows) do print(row) end
+		io.stdout:flush()
+		os.exit(0)
+	end
+end
+
+-- tee₁ 会话写出（l0/main.lua 组装段同构）：头行 + cmnt 固定文本 + 帧块
+--（帧号 0 起、与序数一致——fr_session.parse_text 连续性校验）。文件 UTF-8/LF
+--（"wb" 防 CRT 文本模式 CRLF 改写），末尾单 LF（canonical）。
+local function write_session()
+	local parts = {
+		("frb1 640 480 %s base %d"):format(SHA, SEED),
+		"cmnt fork capture rig session",
+	}
 	local assets = love.graphics._frTakeAssets()
-	for _, row in ipairs(assets) do print(row) end
-	local rows = love.graphics._frTakeSession()
-	for _, row in ipairs(rows) do print(row) end
-	io.stdout:flush()
-	os.exit(0)
+	for f = 1, frame do
+		parts[#parts + 1] = ("frame %d"):format(f - 1)
+		parts[#parts + 1] = ("dt %.6f"):format(FIXED_DT)
+		if f == 1 then
+			for _, row in ipairs(assets) do parts[#parts + 1] = row end
+		end
+		for _, row in ipairs(frame_rows[f]) do parts[#parts + 1] = row end
+	end
+	local fh = assert(io.open(OUT_PATH, "wb"))
+	fh:write(table.concat(parts, "\n") .. "\n")
+	fh:close()
 end
 
 -- 帧体（错误边界内）：rig 的一切行为。
@@ -119,7 +220,7 @@ local function frame_body()
 			if name == "quit" then
 				return 0
 			end
-			-- 其余事件 rig 丢弃（kernel.handlers 注入归 Task 4）
+			-- 其余事件 rig 丢弃（kernel.handlers 注入归后续批次）
 		end
 	end
 
@@ -127,13 +228,28 @@ local function frame_body()
 	love.update(FIXED_DT)
 
 	frame = frame + 1
-	if frame >= VERIFY_FRAME then
+	local verified = false
+	if frame == VERIFY_FRAME then
+		-- 精确一次（tee 模式循环延续到 FRAMES，>= 会在后续帧重复验证）；
+		-- 非 tee：内部 exit(0)；tee：Canvas 验证后返回。
 		verify_frame()
+		verified = true
 	end
 
-	if love.graphics then
-		love.draw()
-		love.graphics.present()     -- 捕获模式：w_present 钩先回放后上屏
+	if not verified then
+		if love.graphics then
+			love.draw()
+			love.graphics.present() -- 捕获模式：w_present 钩先回放后上屏
+		end
+	end
+
+	if TEE then
+		frame_rows[frame] = take_delta()
+		if frame >= FRAMES then
+			write_session()
+			io.stdout:flush()
+			os.exit(0)
+		end
 	end
 
 	if love.timer then love.timer.sleep(0.001) end
