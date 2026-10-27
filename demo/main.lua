@@ -1,4 +1,4 @@
--- demo/main.lua —— B4-2 Task 4 捕获 rig（fork demo：Task 3 全帧捕获 + tee₁ 会话写出）。
+﻿-- demo/main.lua —— B4-2 Task 4 捕获 rig（fork demo：Task 3 全帧捕获 + tee₁ 会话写出）。
 -- 两种模式同一条路径，开关只改变 C++ 侧行为（行为等价回归）：
 --   FR_CAPTURE=1   w_clear/draw/print/rectangle 抑制真执行只记行；构造四件套
 --                  （newImage/newFont/newCanvas/newQuad）走语义替代（资产登记
@@ -52,6 +52,9 @@ end
 
 -- tee₁ 模式：--out 存在即启用；缺省 = 现行验证 rig（stdout 报告，不写文件）。
 local OUT_PATH = get_val("--out")
+if TEE and os.getenv("FR_CAPTURE") ~= "1" then
+	io.stderr:write("l0-demo: --out tee 需 FR_CAPTURE=1（否则会话只有头行）\n")
+end
 local TEE = OUT_PATH ~= nil
 local FRAMES = 4
 local SHA, SEED = nil, 0
