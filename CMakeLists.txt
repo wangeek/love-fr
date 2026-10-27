@@ -610,8 +610,17 @@ set(LOVE_SRC_MODULE_GRAPHICS_ROOT
 set(LOVE_SRC_MODULE_GRAPHICS_FR
 	src/modules/graphics/fr/fr_codec.c
 	src/modules/graphics/fr/fr_codec.h
+	src/modules/graphics/fr/fr_capture.cpp
+	src/modules/graphics/fr/fr_capture.h
 )
 set_source_files_properties(src/modules/graphics/fr/fr_codec.c PROPERTIES LANGUAGE C)
+# fr_capture.cpp 为手写层（真源见 fr_capture.h 注释）；wrap_Graphics.cpp include
+# 了 fr_capture.h（UTF-8 中文注释）——两 TU 须 /utf-8，否则 GBK 代码页下注释尾字节
+# 吞并后续声明（实测 error C2039: w_frTakeSession 不是 fr 的成员）。
+if(MSVC)
+	set_source_files_properties(src/modules/graphics/fr/fr_capture.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
+	set_source_files_properties(src/modules/graphics/wrap_Graphics.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
+endif()
 if(MSVC)
 	set_source_files_properties(src/modules/graphics/fr/fr_codec.c PROPERTIES COMPILE_OPTIONS "/utf-8")
 endif()

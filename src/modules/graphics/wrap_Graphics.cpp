@@ -34,6 +34,8 @@
 
 #include "opengl/Graphics.h"
 
+#include "fr/fr_capture.h"
+
 #include <cassert>
 #include <cstring>
 #include <cstdlib>
@@ -145,6 +147,13 @@ int w_clear(lua_State *L)
 			depth.value = luaL_checknumber(L, startidx + 1);
 	}
 
+	// B4-2 捕获钩：开关开时抑制真执行，只记录 .fr 行（回放入口在 w_present/_frReplay）。
+	if (fr::capture_enabled())
+	{
+		fr::capture_clear(color, colors);
+		return 0;
+	}
+
 	if (colors.empty())
 		luax_catchexcept(L, [&]() { instance()->clear(color, stencil, depth); });
 	else
@@ -180,6 +189,11 @@ int w_discard(lua_State *L)
 
 int w_present(lua_State *L)
 {
+	// B4-2 回放钩：present 前把行缓冲回放到当前渲染目标（屏幕显示的是回放结果，
+	// D8 语义替代）。回放幂等（缓冲全会话累积不消费，见 fr_capture.h）。
+	if (fr::capture_enabled())
+		fr::capture_replay(instance());
+
 	luax_catchexcept(L, [&]() { instance()->present(L); });
 	return 0;
 }
@@ -2912,6 +2926,10 @@ static const luaL_Reg functions[] =
 	{ "clear", w_clear },
 	{ "discard", w_discard },
 	{ "present", w_present },
+
+	// B4-2 FR 捕获层出口（fork 魔改，fr_capture.h）。
+	{ "_frTakeSession", fr::w_frTakeSession },
+	{ "_frReplay", fr::w_frReplay },
 
 	{ "newImage", w_newImage },
 	{ "newArrayImage", w_newArrayImage },
