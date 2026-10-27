@@ -57,3 +57,7 @@ libtool
 stamp-h1
 /src/love
 /src/tags
+
+# fork 魔改侧构建/探针产物不入库（磁盘保留；主构建走仓库外 megasource/build115）
+/build-msvc/
+/build-probe/

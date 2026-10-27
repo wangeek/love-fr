@@ -603,6 +603,19 @@ set(LOVE_SRC_MODULE_GRAPHICS_ROOT
 	src/modules/graphics/wrap_Video.h
 )
 
+# B4-2（fork 魔改）：FR 行编解码生成物——gen_c 双路径再生的 fork 副本，
+# 勿手改（真源 tables/cmd.tbl，改表后根仓库 `python -m tools.fr_gen.gen_c` 同步）。
+# selftest 不入 love 目标（其 main() 冲突）；.c 混入 CXX 目标显式钉 LANGUAGE C，
+# /utf-8 防中文注释在非 UTF-8 代码页（MSVC 默认 ACP）下的 C4819 警告。
+set(LOVE_SRC_MODULE_GRAPHICS_FR
+	src/modules/graphics/fr/fr_codec.c
+	src/modules/graphics/fr/fr_codec.h
+)
+set_source_files_properties(src/modules/graphics/fr/fr_codec.c PROPERTIES LANGUAGE C)
+if(MSVC)
+	set_source_files_properties(src/modules/graphics/fr/fr_codec.c PROPERTIES COMPILE_OPTIONS "/utf-8")
+endif()
+
 set(LOVE_SRC_MODULE_GRAPHICS_OPENGL
 	src/modules/graphics/opengl/Buffer.cpp
 	src/modules/graphics/opengl/Buffer.h
@@ -627,6 +640,7 @@ set(LOVE_SRC_MODULE_GRAPHICS_OPENGL
 set(LOVE_SRC_MODULE_GRAPHICS
 	${LOVE_SRC_MODULE_GRAPHICS_ROOT}
 	${LOVE_SRC_MODULE_GRAPHICS_OPENGL}
+	${LOVE_SRC_MODULE_GRAPHICS_FR}
 )
 
 source_group("modules\\graphics" FILES ${LOVE_SRC_MODULE_GRAPHICS_ROOT})
