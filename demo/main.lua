@@ -36,7 +36,11 @@
 -- 注册状态根（kernel.state，载入期 _frStateRoot 登记）可达子图（Task 1b
 -- 裁定，D8 镜像范围；未注册根回退全堆）；验证帧与 sim 循环显式调
 -- _frStateSubCRC，两路径同一 C 遍历；帧块尾 `s_crc <u32十进制>`。
--- d_crc 本批不加（口径归 Task 3）。
+-- B7a（end 段 d_crc）：s_crc 后紧跟 `d_crc <u32十进制>`——当帧 out 行
+-- 文本（take_delta 同批行，口径 = clear/draw/print/rect，不含 dt/asset/
+-- ev/st/err/s_crc）join "\n" 的 CRC32（cmd.tbl d_crc：out 记录 CRC32）。
+-- 收集点 = tee 分支 take_delta 处（demo 拼串、C 侧 _frCRC32 算——算法
+-- 单一真源在 C）；sim 循环同收集并纳入 SIM_CRC 双比对。
 -- B6 Task 2（log 段 st 物理行，FR_LOGLEVEL=full）：present 钩/显式收集点
 -- 影子镜像 diff 产 st/err 行（同帧纪律与 s_crc 一致）；验证帧与 sim 循环
 -- 显式调 _frStateDiffRows；帧内行序 dt → asset（首帧）→ ev → st/err →
@@ -171,6 +175,7 @@ INJECT_KEY = get_val("--inject-key")
 local taken = 0
 local frame_rows = {}                        -- frame_rows[f] = 第 f 帧的 out 行
 local frame_in_rows = {}                     -- frame_in_rows[f] = 第 f 帧的 ev 行（B5 Task 1）
+local frame_dcrcs = {}                       -- frame_dcrcs[f] = 第 f 帧的 d_crc（B7a）
 
 local function take_delta()
 	local all = love.graphics._frTakeSession()
@@ -351,11 +356,13 @@ local function write_session()
 			for _, row in ipairs(sdiffs[f]) do parts[#parts + 1] = row end
 		end
 		for _, row in ipairs(frame_rows[f]) do parts[#parts + 1] = row end
-		-- B6 Task 1：end 段 s_crc（帧块尾，out 行后；cmd.tbl end 段
-		-- crc u32，十进制 canonical）。d_crc 本批不加——Canvas 回读 CRC
-		-- 与 tee 并存的口径归 Task 3 定，如实登记（end 段暂只有 s_crc）。
+		-- B6 Task 1：end 段 s_crc（out 行后；cmd.tbl end 段 crc u32，十进制
+		-- canonical）+ B7a d_crc（s_crc 后，帧块尾——当帧 out 行文本 CRC32，
+		-- 收集点见 tee 分支）。
 		assert(scrcs[f] ~= nil, "fr-demo: 帧 " .. tostring(f) .. " 缺 s_crc（收集钩缺席？）")
 		parts[#parts + 1] = ("s_crc %d"):format(scrcs[f])
+		assert(frame_dcrcs[f] ~= nil, "fr-demo: 帧 " .. tostring(f) .. " 缺 d_crc（收集点缺席？）")
+		parts[#parts + 1] = ("d_crc %d"):format(frame_dcrcs[f])
 	end
 	local fh = assert(io.open(OUT_PATH, "wb"))
 	fh:write(table.concat(parts, "\n") .. "\n")
@@ -449,6 +456,12 @@ local function frame_body()
 
 	if TEE then
 		frame_rows[frame] = take_delta()
+		-- B7a d_crc：当帧 out 行（take_delta 同批）文本 join "\n" 的 CRC32
+		--（cmd.tbl d_crc：out 记录 CRC32）。行集口径 = out 段 op
+		--（clear/draw/print/rect，不含 dt/asset/ev/st/err/s_crc）；demo 拼串、
+		-- C 侧 _frCRC32 算（算法单一真源在 C）。空帧 join 为 "" → CRC=0，
+		-- 如实记录（demo 每帧恒有 out 行，不达）。
+		frame_dcrcs[frame] = love.graphics._frCRC32(table.concat(frame_rows[frame], "\n"))
 		if in_rows then frame_in_rows[frame] = in_rows end
 		if frame >= FRAMES then
 			write_session()
@@ -548,11 +561,11 @@ local function parse_ev_row(line)
 	return { name = name, args = args }
 end
 
--- 流解析：.fr 文本 → 帧表 {{dt=num, ev={{name,args}}, out={行}, scrc=num}}。
--- 分类按本 rig 会话组装口径：首帧块前只许 frb1/cmnt；帧块内 dt/asset/ev/
--- s_crc 归类（asset 行跳过——sim 侧 register_assets 同序重建，不比对；
--- s_crc=B6 end 段堆 CRC，收集后与重演侧逐帧比对），其余整行进 out
---（与再生行逐字节比对）。
+-- 流解析：.fr 文本 → 帧表 {{dt=num, ev={{name,args}}, out={行}, scrc=num,
+-- dcrc=num}}。分类按本 rig 会话组装口径：首帧块前只许 frb1/cmnt；帧块内
+-- dt/asset/ev/s_crc/d_crc 归类（asset 行跳过——sim 侧 register_assets 同序
+-- 重建，不比对；s_crc=B6 end 段堆 CRC、d_crc=B7a end 段 out 行 CRC，
+-- 收集后与重演侧逐帧比对），其余整行进 out（与再生行逐字节比对）。
 local function parse_stream(path)
 	local fh, e = io.open(path, "rb")
 	if not fh then
@@ -596,6 +609,14 @@ local function parse_stream(path)
 				os.exit(2)
 			end
 			cur.scrc = tonumber(v)
+		elseif op == "d_crc" then
+			-- B7a end 段 out 行 CRC：收集进帧表（录制侧值），旧流无此行则留 nil
+			local v = line:match("^d_crc (%d+)$")
+			if not v then
+				io.stderr:write("fr-demo: d_crc 行非法：", line, "\n")
+				os.exit(2)
+			end
+			cur.dcrc = tonumber(v)
 		elseif op == "st" or op == "err" then
 			-- B6 Task 2：log 段行（full 级 diff 档产物）——重演比对集（含
 			-- err：不受支持的 table 引用槽/表重建行与 st 同源同确定性）
@@ -634,6 +655,12 @@ if SIM_PATH then
 		local frames = parse_stream(SIM_PATH)
 		register_assets()
 		local nmatch, nmis = 0, 0
+		-- B7a：SIM_CRC 双比对（s=堆子图 CRC、d=当帧 out 行 CRC）的判定函数
+		--——旧流无对应行则 skip，不作判定。
+		local function crc_st(rec, genv)
+			if rec == nil then return "skip" end
+			return rec == genv and "ok" or "mis"
+		end
 		for fi, fr in ipairs(frames) do
 			-- ① ev 行还原 push（帧首，同录制注入位）
 			for _, ev in ipairs(fr.ev) do
@@ -667,6 +694,10 @@ if SIM_PATH then
 			--（流有 log 行而本侧 base 或反之）→ 空集对非空集，如实 MISMATCH。
 			local genlog = LOGLVL_FULL and love.graphics._frStateDiffRows() or {}
 			local gen = take_delta()
+			-- B7a：重演侧同收集 d_crc——当帧再生 out 行（take_delta 同批）
+			-- 文本 join "\n" 的 CRC32，与录制侧同口径（demo 拼串、C 侧
+			-- _frCRC32 算）。
+			local dcrc = love.graphics._frCRC32(table.concat(gen, "\n"))
 			-- ④ 比对：ev 条数漂移（push/poll 往返丢失或 OS 噪声混入）+ 逐行位置差
 			local ndiff, first_rec, first_gen = 0, nil, nil
 			local function mark_diff(rec, genl)
@@ -694,13 +725,11 @@ if SIM_PATH then
 				print(("SIM %d MISMATCH %d | REC: %s | GEN: %s")
 					:format(fi - 1, ndiff, first_rec, first_gen))
 			end
-			-- B6：堆 CRC 重演比对（独立于 out 行——内核状态重演全对的自证；
-			-- 旧流无 s_crc 行则 skip，不作判定）。
-			if fr.scrc == nil then
-				print(("SIM_CRC %d skip"):format(fi - 1))
-			else
-				print(("SIM_CRC %d %s"):format(fi - 1, scrc == fr.scrc and "ok" or "mis"))
-			end
+			-- B6/B7a：堆 CRC + out 行 CRC 重演比对（独立于 out 行逐行比对——
+			-- 内核状态重演全对的自证 + 流内 end 段行自洽的防篡改锚；旧流无
+			-- 对应行则该维 skip，不作判定）。
+			print(("SIM_CRC %d s=%s d=%s"):format(fi - 1,
+				crc_st(fr.scrc, scrc), crc_st(fr.dcrc, dcrc)))
 		end
 		local rc2 = nmis == 0 and 0 or 1
 		print(("SIM SUMMARY %d %d %d %d"):format(#frames, nmatch, nmis, rc2))

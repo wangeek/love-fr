@@ -905,6 +905,8 @@ static int offline_parse_text(const std::string &buf, OfflineSession &s)
 			continue; // 离线无 kernel，dt 只跳过
 		if (ln.compare(0, 6, "s_crc ") == 0)
 			continue; // 同上：s_crc 是内核堆快照，离线无 kernel 只跳过（B6）
+		if (ln.compare(0, 6, "d_crc ") == 0)
+			continue; // 同上：d_crc 是录制侧 out 行 CRC（B7a），离线执行域只重算 D_CRC，不消费
 		if (ln.compare(0, 6, "asset ") == 0)
 		{
 			if (!offline_register_asset_text(ln, no))
@@ -954,6 +956,10 @@ static int offline_parse_frame_body(const love::uint8 *body, size_t n, size_t ba
 			break;
 		case FR_OP_S_CRC:
 			// 无 kernel，堆快照 CRC 只消费（B6：tee 会话 end 段行放行）。
+			(void) fr_dec_u32(&d);
+			break;
+		case FR_OP_D_CRC:
+			// 同 s_crc：录制侧 out 行 CRC 只消费（B7a：tee 会话 end 段行放行）。
 			(void) fr_dec_u32(&d);
 			break;
 		case FR_OP_ASSET:
@@ -1242,6 +1248,18 @@ int w_frImageDataCRC(lua_State *L)
 {
 	love::image::ImageData *img = love::luax_checktype<love::image::ImageData>(L, 1);
 	lua_pushinteger(L, (lua_Integer) fr_crc32_bytes(img->getData(), img->getSize()));
+	return 1;
+}
+
+// B7a：字符串字节 CRC32——demo 侧 d_crc 行（当帧 out 行文本）的算法出口。
+// 行集口径（clear/draw/print/rect，take_delta 同批）与 join 语义归调用方
+// （demo 拼串）；算法单一真源在 C（fr_crc32_bytes 与 D_CRC/s_crc 同一
+// CRC32 机，demo 不另置实现）。
+int w_frCRC32(lua_State *L)
+{
+	size_t len = 0;
+	const char *s = luaL_checklstring(L, 1, &len);
+	lua_pushinteger(L, (lua_Integer) fr_crc32_bytes(s, len));
 	return 1;
 }
 

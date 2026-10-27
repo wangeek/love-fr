@@ -168,6 +168,10 @@ love::uint32 fr_assetid(lua_State *L, int idx);
 //       回读 rig 专用——语义替代版不建真 Canvas，见文件头 Canvas 边界）；
 //   love.graphics._frImageDataCRC(img) → ImageData 全字节 CRC32（live
 //       验证帧 D_CRC 与离线回放同一采集函数，对拍锚）；
+//   love.graphics._frCRC32(s) → 字符串字节 CRC32（u32）——B7a d_crc 行的
+//       数据源出口：demo 侧拼当帧 out 行文本（take_delta 同批行 join
+//       "\n"）传入、C 侧算（拼串归调用方、算法单一真源在 C——与 D_CRC/
+//       s_crc 同一 CRC32 机）；
 //   love.graphics._frCanvasProbe(canvas[, frame]) → 验证帧三点像素回读
 //       + PIXELS 汇总 + D_CRC（B6：整环 C 侧 printf，stdout 行与原 Lua
 //       环逐字节同构——Lua 侧 getPixel/format/print 在验证帧留 live 残留
@@ -178,6 +182,7 @@ int w_frTakeAssets(lua_State *L);
 int w_frReplay(lua_State *L);
 int w_frNewCanvasReal(lua_State *L);
 int w_frImageDataCRC(lua_State *L);
+int w_frCRC32(lua_State *L);
 int w_frCanvasProbe(lua_State *L);
 int w_frOfflineReplay(lua_State *L);
 

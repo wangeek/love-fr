@@ -16,9 +16,11 @@
  * ——字符串哈希种子每进程随机，槽位线性序跨进程不可复现，与全堆口径同理）；
  * table 引用槽 = canonical tag 位 + 子表递归 CRC（记忆化 map<Table*,u32>，
  * 同表多处引用只算一次；类型可辨与内容敏感两全）；环（in-progress 引用）
- * 按常数 0xC1C1E1E1 计并记 err 行一次（demo 无环，防御性）；str/udata/func
- * 槽只计 tag 位、number 全位型、nil/bool 原位型（canonicalization 与全堆
- * 口径同一函数）。递归深度不设限（demo 状态浅 2-3 层，深图栈风险如实登记）。
+ * 按常数 0xC1C1E1E1 计并记 err 行一次（demo 无环，防御性）；str 槽 =
+ * tag 位 + (len+内容) CRC32（B7a 单一化：与 diff 槽指纹同规则，字符串
+ * 值变化进 s_crc）、udata/func 等其余引用槽只计 tag 位、number 全位型、
+ * nil/bool 原位型（canonicalization 与全堆口径同一函数）。递归深度不设限
+ * （demo 状态浅 2-3 层，深图栈风险如实登记）。
  *
  * 全堆口径（Task 1，回退路径）：沿 G(L)->gc.root 的 nextgc 链（分配序的
  * 逆——无 GC 紧缩下稳定）× 槽位序（数组部 asize 个 TValue 后 hash 部
@@ -26,12 +28,14 @@
  * 天然进 CRC）；Node.key 不计（只 val）。GC 紧缩改链序 → CRC 变 = 已知
  * 边界（跨紧缩的流间对比不承诺）。
  *
- * GC 载荷规范化（两口径共用，本实现定形，如实登记）：str/tab/udata/func
- * 等 GC 引用槽与 lightuserdata 槽只计 tag 位（GC64 NaN 框高 17 位 / 非
- * GC64 的 it 域），载荷指针位清零——堆地址随 ASLR 每进程漂移，原样计入
- * 则同参双跑不可复现；number 槽计全 8 字节位型（double/零扩 int，确定性）；
- * nil/true/false 计原位型。结构敏感性：每表 asize/hmask 头部混入 + 对象
- * 计数收尾混入（值同结构变仍改 CRC）。
+ * GC 载荷规范化（两口径共用，本实现定形，如实登记）：str 槽 = tag 位 +
+ * (len+内容) CRC32（B7a 单一化，内容跨进程确定——CRC 增量直读 strdata
+ * 字节不复制）；tab/udata/func 等 GC 引用槽与 lightuserdata 槽只计
+ * tag 位（GC64 NaN 框高 17 位 / 非 GC64 的 it 域），载荷指针位清零——
+ * 堆地址随 ASLR 每进程漂移，原样计入则同参双跑不可复现；number 槽计
+ * 全 8 字节位型（double/零扩 int，确定性）；nil/true/false 计原位型。
+ * 结构敏感性：每表 asize/hmask 头部混入 + 对象计数收尾混入（值同结构
+ * 变仍改 CRC）。
  *
  * 只读红线（两口径同）：不置 marked、不调任何 lj_ 内部函数、不触发 GC
  * ——纯字节读；收集点在 C 钩/显式出口内（无 Lua 执行窗口），子图根取回

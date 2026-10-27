@@ -47,10 +47,35 @@ static_assert(sizeof(TValue) == 8, "LuaJIT TValue 应为 8 字节（GC64 NaN 框
 // GC 载荷规范化（fr_statediff.h 口径）：指针位清零只留 tag——堆地址随
 // ASLR 每进程漂移，原样计入则双跑确定性破。number 全位型、primitive
 // （nil/true/false）原位型，二者本就无指针。
+//
+// B7a 单一化：str 槽 = tag 位 + (len+内容) CRC32——s_crc（canonical_tv）
+// 与 diff 槽指纹（slot_fp）从此同一函数同一规则（此前 diff 档对 str 补
+// 内容 CRC、s_crc 只计 tag 位，两处维护且 s_crc 有字符串内容盲区——
+// banner "L0"→"KEY" 类变化逮不住，B6 自审项收敛）。内容直读 strdata
+// 增量进 CRC（不复制大串，只读红线不破）；len 混入防等长内容混淆。
+static love::uint32 str_content_crc(const GCstr *s)
+{
+	love::uint32 crc = 0xFFFFFFFFu;
+	crc = fr_crc32_update(crc, &s->len, sizeof(s->len));
+	crc = fr_crc32_update(crc, strdata(s), s->len);
+	return crc ^ 0xFFFFFFFFu;
+}
+
 static uint64_t canonical_tv(const TValue *tv)
 {
 	if (tvisnumber(tv))
 		return tv->u64;
+	if (tvisstr(tv))
+	{
+		// str：tag 位 | 内容 CRC（低 32 位）——类型可辨 + 内容敏感，
+		// 地址位不进指纹（跨进程确定）。
+#if LJ_GC64
+		return ((uint64_t) tv->it64 & 0xFFFF800000000000ull)
+		       | str_content_crc(strV(tv));
+#else
+		return (tv->u64 & 0xFFFFFFFF00000000ull) | str_content_crc(strV(tv));
+#endif
+	}
 	if (tvisgcv(tv) || tvislightud(tv))
 	{
 #if LJ_GC64
@@ -317,32 +342,21 @@ namespace
 // 搬移漂移——Brent 变体 newkey 可在 rehash 外移动条目，lj_tab.c:458-507，
 // 按下标镜像会假阳性，键寻址才稳）。
 //
-// 槽指纹（diff 档专用）：canonical_tv 基础上对 str 槽补内容 CRC——CRC 档
-// 口径 str 只计 tag 位（Task 1，载荷指针位清零保双跑确定），但 diff 档的
-// 物理行要逮字符串值变化（banner "L0"→"KEY"，实测曾整段漏发）；内容
-//（len+bytes）跨进程确定，指针位仍不进指纹。table 引用槽维持 tag 位
-//（子表内容由子表自身镜像覆盖；s_crc 的 str 内容盲区同为 Task 1 既定
-// 口径，登记自审，本批不动 CRC 语义）。
+// 槽指纹（B7a 单一化）：canonical_tv 位型即指纹——number 全位型 / str =
+// tag+len+内容 CRC（banner "L0"→"KEY" 类字符串值变化检出）/ 其余 GC 引用
+// 与 lightuserdata tag 位（载荷指针位清零保双跑确定）。table 引用槽维持
+// tag 位（子表内容由子表自身镜像覆盖）；与 s_crc 走同一函数，两档一处
+// 维护（此前 diff 档补 strc 旁路字段，本批收敛删除）。
 struct SlotFp
 {
-	uint64_t canon = 0;      // canonical_tv 位型（number 全位型 / GC 引用 tag 位）
-	love::uint32 strc = 0;   // str 槽内容 CRC32（0=非 str）
-	bool operator!=(const SlotFp &o) const { return canon != o.canon || strc != o.strc; }
+	uint64_t canon = 0;      // canonical_tv 位型（str 含内容 CRC）
+	bool operator!=(const SlotFp &o) const { return canon != o.canon; }
 };
 
 static SlotFp slot_fp(const TValue *tv)
 {
 	SlotFp fp;
 	fp.canon = canonical_tv(tv);
-	if (tvisstr(tv))
-	{
-		const GCstr *s = strV(tv);
-		love::uint32 crc = 0xFFFFFFFFu;
-		crc = fr_crc32_update(crc, &fp.canon, sizeof(fp.canon));
-		crc = fr_crc32_update(crc, &s->len, sizeof(s->len));
-		crc = fr_crc32_update(crc, strdata(s), s->len);
-		fp.strc = crc ^ 0xFFFFFFFFu;
-	}
 	return fp;
 }
 

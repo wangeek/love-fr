@@ -3092,6 +3092,7 @@ static const luaL_Reg functions[] =
 	{ "_frReplay", fr::w_frReplay },
 	{ "_frNewCanvasReal", fr::w_frNewCanvasReal },
 	{ "_frImageDataCRC", fr::w_frImageDataCRC },
+	{ "_frCRC32", fr::w_frCRC32 },               // B7a：字符串 CRC32（d_crc 行数据源出口）
 	{ "_frCanvasProbe", fr::w_frCanvasProbe },
 	{ "_frOfflineReplay", fr::w_frOfflineReplay },
 	{ "_frStateRoot", fr::w_frStateRoot },       // B6 Task 1b：登记状态根（子图 s_crc 口径）
