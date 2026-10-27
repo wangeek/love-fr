@@ -95,6 +95,11 @@ static std::string esc(const std::string &s)
 	return out;
 }
 
+std::string fr_esc_text(const std::string &s)
+{
+	return esc(s);
+}
+
 // esc 的逆（replay 行解析用）：\\ \" \n \r \t 展开为原始字节；非法转义
 //（esc 不产的形态）原样保留两字符——原文本含 `\x` 时 esc 产 `\\x`，逆展开
 // 得回 `\x`，round-trip 保真。

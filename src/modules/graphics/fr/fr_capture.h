@@ -78,6 +78,10 @@ enum FrAssetKind
 // FR_CAPTURE=1 开启；env 只在首次调用读一次并缓存（启动口径）。
 bool capture_enabled();
 
+// canonical 文本转义（\ " \n \r \t，fr.esc 同构）——捕获行与 fr_statediff 的
+// st/err 行共用（单一格式源；控制字符校验归 fr_check 解析侧，demo 文本受控）。
+std::string fr_esc_text(const std::string &s);
+
 // CRC32（l0/walker.lua 同构：查表 0xEDB88320、reflected、init/xorout
 // 0xFFFFFFFF；空输入 = 0）。一次性外壳为 D_CRC 对拍锚（live 验证帧与
 // 离线回放同一采集语义，勿改）；增量入口供 fr_statediff 逐段混入（同

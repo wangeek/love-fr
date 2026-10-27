@@ -194,8 +194,13 @@ int w_present(lua_State *L)
 	// 确定性 CRC 入当帧缓存——end 段 s_crc 数据源；根已注册（demo 载入期
 	// 登记 kernel.state）→ 可达子图 CRC，否则全堆回退。无窗也采（tee
 	// 无头/有窗逐字节一致锚；遍历纯字节读无 GL 依赖，红线见 fr_statediff.h）。
+	// B6 Task 2（diff 档）：同一 present 点影子镜像 diff → st 物理行入当帧
+	// 缓存（FR_LOGLEVEL≠full 时函数内自 no-op——档位隔离）。
 	if (fr::capture_enabled())
+	{
 		fr::capture_state_crc(L);
+		fr::capture_state_diff(L);
+	}
 
 	// B4-2 回放钩：present 前把行缓冲回放到当前渲染目标（屏幕显示的是回放结果，
 	// D8 语义替代）。回放幂等（缓冲全会话累积不消费，见 fr_capture.h）。
@@ -3093,6 +3098,8 @@ static const luaL_Reg functions[] =
 	{ "_frStateSubCRC", fr::w_frStateSubCRC },   // B6 Task 1b：子图 CRC 显式出口（验证帧/sim）
 	{ "_frStateCRC", fr::w_frStateCRC },         // B6：全堆 CRC 口径保留（审计/对照）
 	{ "_frTakeSCrcs", fr::w_frTakeSCrcs },       // B6：每帧 s_crc 数组（end 段组装）
+	{ "_frStateDiffRows", fr::w_frStateDiffRows }, // B6 Task 2：diff 档显式收集（验证帧/sim），返回当帧 st/err 行
+	{ "_frTakeSDiffRows", fr::w_frTakeSDiffRows }, // B6 Task 2：每帧 log 段行数组（full 档 tee 组装）
 
 	{ "newImage", w_newImage },
 	{ "newArrayImage", w_newArrayImage },

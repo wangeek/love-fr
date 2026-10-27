@@ -44,6 +44,20 @@
  * GL 依赖）；验证帧（demo 不走 present）与 --sim 独立循环由 demo 侧显式
  * 调 _frStateSubCRC——两路径同一 C 遍历。每帧缓存一份（_frTakeSCrcs
  * 全量取走，tee 组装 end 段）。
+ *
+ * diff 档（Task 2，FR_LOGLEVEL=full）：同根子图的影子镜像 diff → 当帧
+ * log 段 st 物理行（`st <objid> "<key>" <variant>`，cmd.tbl st 签名：
+ * obj u32 / key str / val variant 两 token）+ err 行（cmd.tbl err what str
+ * 单串——表重建 `err "st-rehash <id> <asize> <hmask>"`（err notes"表重建
+ * 计数"语义位，计划口径 *rehash* 行按 cmd.tbl 为准收进 err 载体）与值域
+ * 外槽 `err "st-unsupported <id> <slot> <tag>"`）。镜像 = statediff 自有
+ * 内存（堆外，不算写 VM）：数组部下标对位存 canonical 槽指纹、hash 部按
+ * key canonical 串寻址（Node 落桶随 Brent 搬移漂移，键寻址才稳）；表重建
+ *（首见/asize|hmask 变）全槽重发；nil 槽不产行（variant 域无 nil，
+ * cmd.tbl 为准——变 nil=槽缺席，值保真由 s_crc 全位型承担）。对象 id 跨
+ * 帧单调递增不复用；Table* 复用弱校验 (asize,hmask,指纹) + id 换新
+ *（epoch 最简实现，demo 深度不触发，防御登记）。行序确定性：根表槽行在
+ * 前、子表递归在后，槽序 = 数组部 0 基下标 + hash 部 key 串字节序。
  **/
 
 #pragma once
@@ -52,6 +66,7 @@
 #include "common/config.h"
 #include "common/int.h"
 
+#include <string>
 #include <vector>
 
 struct lua_State;
@@ -75,6 +90,22 @@ love::uint32 fr_state_sub_crc(struct lua_State *L);
 // 根已注册 → 子图 CRC，否则全堆）。
 void capture_state_crc(struct lua_State *L);
 
+// ------------------------------------------------------------------
+// B6 Task 2：diff 档（影子镜像 + st 物理行 + 表重建，FR_LOGLEVEL=full）
+// ------------------------------------------------------------------
+
+// FR_LOGLEVEL=full 开档（env 首读缓存，与 capture_enabled 同款纪律）。
+bool state_diff_full();
+
+// 当帧 diff 行收集（根取回与 sub CRC 同根；st/err 行序确定性：子图先根表
+// 自身槽行、后子表递归（槽序 = 数组部 0 基下标序 + hash 部 key canonical
+// 串字节序——Node 线性序跨进程不可复现，与 CRC multiset 同因））。未注册
+// 根 → 无行（全堆口径不产 diff 行，stderr 登记）；纯读不写 VM，红线同上。
+std::vector<std::string> fr_state_diff_rows(struct lua_State *L);
+
+// present 钩入口：full 级收集 diff 行入当帧缓存（非 full 自 no-op）。
+void capture_state_diff(struct lua_State *L);
+
 // Lua 出口：
 //   love.graphics._frStateRoot(t)    → 登记状态根（table 后者覆盖 / nil 清除）；
 //   love.graphics._frStateSubCRC()   → 子图 CRC 入当帧缓存并返回 u32
@@ -82,10 +113,17 @@ void capture_state_crc(struct lua_State *L);
 //       未注册根回退全堆，与 present 钩口径一致）；
 //   love.graphics._frStateCRC()      → 全堆 CRC 入当帧缓存并返回 u32
 //       （Task 1 口径保留，审计/对照用——demo 收集点不走此口）；
-//   love.graphics._frTakeSCrcs()     → 每帧 s_crc 数组（收集序 = 帧序）。
+//   love.graphics._frTakeSCrcs()     → 每帧 s_crc 数组（收集序 = 帧序）；
+//   love.graphics._frStateDiffRows() → 当帧 diff 行（st/err）入缓存并返回
+//       行表（验证帧 / --sim 的 diff 档显式收集口——与 present 钩同一遍历；
+//       档位策略归调用点，本出口是机制口）；
+//   love.graphics._frTakeSDiffRows() → 每帧 diff 行数组的数组（帧序，tee
+//       组装 log 段用；收集序与 _frTakeSCrcs 同帧纪律——每帧恰一份）。
 int w_frStateRoot(lua_State *L);
 int w_frStateSubCRC(lua_State *L);
 int w_frStateCRC(lua_State *L);
 int w_frTakeSCrcs(lua_State *L);
+int w_frStateDiffRows(lua_State *L);
+int w_frTakeSDiffRows(lua_State *L);
 
 } // fr

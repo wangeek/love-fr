@@ -37,6 +37,10 @@
 -- 裁定，D8 镜像范围；未注册根回退全堆）；验证帧与 sim 循环显式调
 -- _frStateSubCRC，两路径同一 C 遍历；帧块尾 `s_crc <u32十进制>`。
 -- d_crc 本批不加（口径归 Task 3）。
+-- B6 Task 2（log 段 st 物理行，FR_LOGLEVEL=full）：present 钩/显式收集点
+-- 影子镜像 diff 产 st/err 行（同帧纪律与 s_crc 一致）；验证帧与 sim 循环
+-- 显式调 _frStateDiffRows；帧内行序 dt → asset（首帧）→ ev → st/err →
+-- out → s_crc；头行 loglvl 随档（base|full）。sim 的 log 行纳入比对集。
 --
 -- B5 Task 1（事件捕获 + 事件驱动化）：poll 循环不再丢弃——白名单内离散输入
 -- 事件逐条记 ev 行进当帧 in 缓冲（Lua 侧拼行，格式源对齐 l0/fr.lua 的
@@ -65,6 +69,11 @@ local FIXED_DT = 0.016667
 -- 拓扑 C 无头（B4 阶段三 Task 4）：FR_HEADLESS=1 + conf.lua t.window=false。
 -- 捕获/tee 全 GL-free；验证帧回读与回放跳过（探针定论的仅剩 GL 依赖点）。
 local HEADLESS = os.getenv("FR_HEADLESS") == "1"
+
+-- B6 Task 2（diff 档）：FR_LOGLEVEL=full → present 钩/显式收集点同产 st 物理行
+--（影子镜像 diff，C 侧 fr_statediff）进当帧 log 段；帧内行序 dt → asset →
+-- ev → st/err → out → s_crc。头行 loglvl 随档（fr_session 三档域 off|base|full）。
+local LOGLVL_FULL = os.getenv("FR_LOGLEVEL") == "full"
 
 -- ------------------------------------------------------------------
 -- 参数解析（l0/main.lua 同款：arg[1]=游戏目录，游戏参数从 arg[2] 起）
@@ -316,21 +325,30 @@ end
 --（"wb" 防 CRT 文本模式 CRLF 改写），末尾单 LF（canonical）。
 local function write_session()
 	local parts = {
-		("frb1 640 480 %s base %d"):format(SHA, SEED),
+		("frb1 640 480 %s %s %d"):format(SHA, LOGLVL_FULL and "full" or "base", SEED),
 		"cmnt fork capture rig session",
 	}
 	local assets = love.graphics._frTakeAssets()
 	local scrcs = love.graphics._frTakeSCrcs()   -- B6：每帧堆 CRC（end 段）
+	local sdiffs = LOGLVL_FULL and love.graphics._frTakeSDiffRows() or nil
+	                                             -- B6 Task 2：每帧 log 段行
 	for f = 1, frame do
 		parts[#parts + 1] = ("frame %d"):format(f - 1)
 		parts[#parts + 1] = ("dt %.6f"):format(FIXED_DT)
 		if f == 1 then
 			for _, row in ipairs(assets) do parts[#parts + 1] = row end
 		end
-		-- B5 Task 1：帧内行序 dt → asset（首帧）→ ev（in 段）→ out
+		-- B5 Task 1：帧内行序 dt → asset（首帧）→ ev（in 段）→ st/err（log
+		-- 段，full 级）→ out → s_crc（end 段）
 		local ins = frame_in_rows[f]
 		if ins then
 			for _, row in ipairs(ins) do parts[#parts + 1] = row end
+		end
+		-- B6 Task 2：log 段 st 物理行 + err 行（diff 档；收集点 = present 钩/
+		-- 验证帧显式，与 s_crc 同帧纪律——每帧恰一份）
+		if sdiffs then
+			assert(sdiffs[f] ~= nil, "fr-demo: 帧 " .. tostring(f) .. " 缺 diff 行（收集钩缺席？）")
+			for _, row in ipairs(sdiffs[f]) do parts[#parts + 1] = row end
 		end
 		for _, row in ipairs(frame_rows[f]) do parts[#parts + 1] = row end
 		-- B6 Task 1：end 段 s_crc（帧块尾，out 行后；cmd.tbl end 段
@@ -408,6 +426,9 @@ local function frame_body()
 		-- 就不入 CRC）。无头本帧走 present 钩，两侧每帧恰一份。
 		collectgarbage("collect")
 		love.graphics._frStateSubCRC()
+		-- B6 Task 2：diff 档同点显式收集（full 级）——与 present 钩同一 C
+		-- 遍历，行入当帧缓存（write_session 组装 log 段）。
+		if LOGLVL_FULL then love.graphics._frStateDiffRows() end
 		-- 精确一次（tee 模式循环延续到 FRAMES，>= 会在后续帧重复验证）；
 		-- 非 tee：内部 exit(0)；tee：Canvas 验证后返回。
 		verify_frame()
@@ -549,7 +570,7 @@ local function parse_stream(path)
 				io.stderr:write("fr-demo: frame 序号不连续：", line, "\n")
 				os.exit(2)
 			end
-			cur = { dt = nil, ev = {}, out = {} }
+			cur = { dt = nil, ev = {}, out = {}, logrows = {} }
 			frames[#frames + 1] = cur
 		elseif not cur then
 			if op == "frb1" then
@@ -575,6 +596,10 @@ local function parse_stream(path)
 				os.exit(2)
 			end
 			cur.scrc = tonumber(v)
+		elseif op == "st" or op == "err" then
+			-- B6 Task 2：log 段行（full 级 diff 档产物）——重演比对集（含
+			-- err：不受支持的 table 引用槽/表重建行与 st 同源同确定性）
+			cur.logrows[#cur.logrows + 1] = line
 		elseif op == "ev" then
 			cur.ev[#cur.ev + 1] = parse_ev_row(line)
 		else
@@ -637,6 +662,10 @@ if SIM_PATH then
 			-- collectgarbage 沿用录制侧既定口径。
 			collectgarbage("collect")
 			local scrc = love.graphics._frStateSubCRC()
+			-- B6 Task 2：diff 档同点收集（FR_LOGLEVEL=full 时非空）——st/err
+			-- 行纳入 SIM 比对集（状态演化重演一致的强判据）；档位不对称
+			--（流有 log 行而本侧 base 或反之）→ 空集对非空集，如实 MISMATCH。
+			local genlog = LOGLVL_FULL and love.graphics._frStateDiffRows() or {}
 			local gen = take_delta()
 			-- ④ 比对：ev 条数漂移（push/poll 往返丢失或 OS 噪声混入）+ 逐行位置差
 			local ndiff, first_rec, first_gen = 0, nil, nil
@@ -650,6 +679,11 @@ if SIM_PATH then
 			for i = 1, math.max(#fr.out, #gen) do
 				if fr.out[i] ~= gen[i] then
 					mark_diff(fr.out[i] or "-", gen[i] or "-")
+				end
+			end
+			for i = 1, math.max(#fr.logrows, #genlog) do
+				if fr.logrows[i] ~= genlog[i] then
+					mark_diff(fr.logrows[i] or "-", genlog[i] or "-")
 				end
 			end
 			if ndiff == 0 then
