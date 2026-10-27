@@ -52,10 +52,10 @@ end
 
 -- tee₁ 模式：--out 存在即启用；缺省 = 现行验证 rig（stdout 报告，不写文件）。
 local OUT_PATH = get_val("--out")
+local TEE = OUT_PATH ~= nil
 if TEE and os.getenv("FR_CAPTURE") ~= "1" then
 	io.stderr:write("l0-demo: --out tee 需 FR_CAPTURE=1（否则会话只有头行）\n")
 end
-local TEE = OUT_PATH ~= nil
 local FRAMES = 4
 local SHA, SEED = nil, 0
 
