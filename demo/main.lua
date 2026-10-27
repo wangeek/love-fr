@@ -11,9 +11,10 @@
 -- 资产等价基准（B4 阶段三口径）：红方块两版同色——捕获版 draw 回放经真纹理
 -- 物化（登记 ImageData 字节 → Image），真版 Image 由同一份红色 ImageData 建
 -- 真纹理。红条/背景为无资产 op，天然两版同色。
--- 自定义 love.run（Task 2 骨架沿用）：pump → poll 丢弃 → update(dt) →
---   验证帧（frame 3：真 Canvas（_frNewCanvasReal，开关无关）→ draw →
---   _frReplay → 三点 getPixel 回读）→ draw → present。
+-- 自定义 love.run（Task 2 骨架沿用）：pump → poll 捕获 ev 行/分发 handlers
+--   （B5 Task 1，此前为丢弃）→ update(dt) → 验证帧（frame 3：真 Canvas
+--   （_frNewCanvasReal，开关无关）→ draw → _frReplay → 三点 getPixel 回读）
+--   → draw → present。
 -- 官方骨架的两处省略（rig 口径，Task 2 实测记录）：
 --   - 不做 love.graphics.clear(getBackgroundColor()) 预清屏——它会混入捕获会话行；
 --   - 不做 isActive 守卫——rig 只跑数帧即退出，窗口最小化非目标场景。
@@ -23,12 +24,22 @@
 -- tee₁ 会话写出（Task 4）：--out <path> 存在即启用 tee 模式——会话末组装 .fr
 -- 文本写文件（UTF-8/LF，末尾单 LF）。组装口径复用 l0/main.lua 的成熟结构：
 -- 头行 `frb1 640 480 <sha> base <seed>` + cmnt 固定文本 + 帧块（帧内行序
--- dt → 资产（仅 frame 0，checkpoint 注入口径）→ out（捕获行））。C 捕获层
--- 当前不产 st/s_crc/d_crc 行（会话级校验归 B6 堆遍历）——**本会话为
+-- dt → 资产（仅 frame 0，checkpoint 注入口径）→ in 事件行 → out 捕获行）。
+-- C 捕获层当前不产 st/s_crc/d_crc 行（会话级校验归 B6 堆遍历）——**本会话为
 -- out-only 形态，end 段缺省**。参数：--frames N（缺省 4）、--sha <64hex>
 --（cmd.tbl 指纹，调用侧算好传入；缺/坏报错 exit 2，L0 同款）、--seed n
 --（缺省 0）。确定性：FIXED_DT 固定 + cmnt 固定 + 无随机 → 两次运行逐字节
 -- 一致（测试锚）。验证帧（frame 3）的 Canvas 回读与 tee 并存：先验证后 tee。
+--
+-- B5 Task 1（事件捕获 + 事件驱动化）：poll 循环不再丢弃——白名单内离散输入
+-- 事件逐条记 ev 行进当帧 in 缓冲（Lua 侧拼行，格式源对齐 l0/fr.lua 的
+-- esc/f/tok_variant）+ 分发 kernel.handlers（事件驱动 out 行）。ev 行形
+-- `ev <slot> "<name>" <src> <argc> <variant...>`（fr-spec §6.2），src=0
+--（poll 取出即 OS 路径——注入的 push 落同一队列同路径取出）。环境/连续
+-- 事件（focus/visible/mousefocus/textedited/mousemoved——实测真窗口首帧
+-- 即达，且随鼠标位置/焦点态漂移）不记不分发：tee 确定性口径 = 不注入则
+-- in 段为空。注入脚本 --inject-click <x>,<y>（帧 1）/ --inject-key <key>
+--（帧 2）：帧首 push、poll 前——同帧取出（帧号 = 帧块号 0-based）。
 local kernel = require("kernel")
 
 local FIXED_DT = 0.016667
@@ -105,11 +116,27 @@ if TEE then
 	end
 end
 
+-- B5 Task 1 注入脚本：--inject-click <x>,<y>（帧 1 push mousepressed）、
+-- --inject-key <key>（帧 2 push keypressed）。帧号 = 帧块号（0-based）：
+-- 帧首 push、poll 前 → 同帧 poll 取出（见 frame_body）。
+local INJECT_CLICK, INJECT_KEY = nil, nil
+local ic = get_val("--inject-click")
+if ic then
+	local xs, ys = ic:match("^(%-?%d+),(%-?%d+)$")
+	if not xs then
+		io.stderr:write("fr-demo: --inject-click 须为 <x>,<y> 整数对\n")
+		os.exit(2)
+	end
+	INJECT_CLICK = { x = tonumber(xs), y = tonumber(ys) }
+end
+INJECT_KEY = get_val("--inject-key")
+
 -- C 层会话缓冲全会话累积不消费（fr_capture.h：take 是拷贝）；帧界由 Lua 侧
 -- 按已取走行数切 delta——每帧的捕获行恰落在该帧 op 记录点之后（验证帧的
 -- Canvas 捕获也归该帧）。
 local taken = 0
 local frame_rows = {}                        -- frame_rows[f] = 第 f 帧的 out 行
+local frame_in_rows = {}                     -- frame_in_rows[f] = 第 f 帧的 ev 行（B5 Task 1）
 
 local function take_delta()
 	local all = love.graphics._frTakeSession()
@@ -120,6 +147,58 @@ local function take_delta()
 	taken = #all
 	return delta
 end
+
+-- ---------------- B5 Task 1：ev 行拼行（格式源对齐 l0/fr.lua） ----------------
+-- 与 l0/fr.lua 的 esc/f/tok_variant 同构（单一格式源原则的 Lua 侧镜像；
+-- C 出口形态留待后续批次统一）。
+
+-- 字符串转义：\ " \n \r \t 转义；其余 C0 与 U+2028/U+2029 拒收
+-- （canonical 文本行不容纳未转义控制字符，防行撕裂——fr-spec §6 封版）。
+-- C0 检查逐字节做（LuaJIT 下源码 \0 转义进 pattern 不可靠）。
+local function esc(s)
+	for i = 1, #s do
+		local b = s:byte(i)
+		if b < 32 and b ~= 9 and b ~= 10 and b ~= 13 then
+			error("fr-demo: 控制字符禁入 canonical 文本")
+		end
+	end
+	if s:find("\226\128\168", 1, true) or s:find("\226\128\169", 1, true) then
+		error("fr-demo: U+2028/U+2029 禁入 canonical 文本")
+	end
+	s = s:gsub("\\", "\\\\")
+	s = s:gsub('"', '\\"')
+	s = s:gsub("\n", "\\n")
+	s = s:gsub("\r", "\\r")
+	s = s:gsub("\t", "\\t")
+	return s
+end
+
+-- 量化域文本：%.6f 定长，NaN/Inf 拒收
+local function fnum(v)
+	if v ~= v or v == math.huge or v == -math.huge then
+		error("fr-demo: NaN/Inf 禁入数值域")
+	end
+	return string.format("%.6f", v)
+end
+
+-- variant → token：num <%.6f> / str "<引号串>" / bool 0|1（poll 返回值只会有
+-- number/boolean/string——白名单事件不含 userdata 形态）
+local function tok_variant(v)
+	local tv = type(v)
+	if tv == "boolean" then return v and "bool 1" or "bool 0" end
+	if tv == "number" then return "num " .. fnum(v) end
+	if tv == "string" then return 'str "' .. esc(v) .. '"' end
+	error("fr-demo: 非法 variant: " .. tostring(v))
+end
+
+-- in 段白名单（cmd.tbl ev 行 type=handlers 键名的离散输入子集）：环境/连续
+-- 事件（focus/visible/mousefocus/textedited/mousemoved）不记不分发——
+-- mousemoved/focus 类随鼠标位置与焦点态漂移，进流则 tee 确定性破（实测
+-- 真窗口首帧 poll 即达 visible/focus/textedited/mousefocus/mousemoved 五条）。
+local IN_EVENTS = {
+	keypressed = true, keyreleased = true, textinput = true,
+	mousepressed = true, mousereleased = true, wheelmoved = true,
+}
 
 -- IR 适配层：kernel 说 IR 语义（rgba8 0-255、mode 0=fill 1=line，cmd.tbl 口径），
 -- 翻译为 love.graphics 的 0-1 浮点 + 字符串 mode + setColor 状态折算。
@@ -235,6 +314,11 @@ local function write_session()
 		if f == 1 then
 			for _, row in ipairs(assets) do parts[#parts + 1] = row end
 		end
+		-- B5 Task 1：帧内行序 dt → asset（首帧）→ ev（in 段）→ out
+		local ins = frame_in_rows[f]
+		if ins then
+			for _, row in ipairs(ins) do parts[#parts + 1] = row end
+		end
 		for _, row in ipairs(frame_rows[f]) do parts[#parts + 1] = row end
 	end
 	local fh = assert(io.open(OUT_PATH, "wb"))
@@ -244,13 +328,43 @@ end
 
 -- 帧体（错误边界内）：rig 的一切行为。
 local function frame_body()
+	local in_rows = nil                -- 本帧 ev 行（B5 Task 1；nil = 无事件帧）
 	if love.event then
+		-- 注入脚本（帧首 push、poll 前——同帧取出）：参数序对齐 OS 事件形态
+		--（Event.cpp convert 实测）：mousepressed = x y button istouch presses
+		-- 五参；keypressed = key scancode isrepeat 三参（注入以 key 兼作 scancode）。
+		if INJECT_CLICK and frame == 1 then
+			love.event.push("mousepressed", INJECT_CLICK.x, INJECT_CLICK.y, 1, false, 1)
+		end
+		if INJECT_KEY and frame == 2 then
+			love.event.push("keypressed", INJECT_KEY, INJECT_KEY, false)
+		end
+
 		love.event.pump()
-		for name in love.event.poll() do
+		-- poll 逐条取全参（poll_i 返回 name+全部存储参数，无 5 参上限——
+		-- generic for 的 a,b,c,d,e 绑定反而截尾，故 table 收全）。
+		local pi = love.event.poll()
+		local slot = 0
+		while true do
+			local ev = { pi() }
+			local name = ev[1]
+			if name == nil then break end
 			if name == "quit" then
 				return 0
 			end
-			-- 其余事件 rig 丢弃（kernel.handlers 注入归后续批次）
+			if IN_EVENTS[name] then
+				local argc = #ev - 1
+				local toks = { ('ev %d "%s" 0 %d'):format(slot, esc(name), argc) }
+				for i = 2, #ev do
+					toks[#toks + 1] = tok_variant(ev[i])
+				end
+				slot = slot + 1
+				in_rows = in_rows or {}
+				in_rows[#in_rows + 1] = table.concat(toks, " ")
+				-- 分发（poll 快照逐条、当帧完成）：有则调，无则只记录
+				local h = kernel.handlers[name]
+				if h then h(unpack(ev, 2)) end
+			end
 		end
 	end
 
@@ -277,6 +391,7 @@ local function frame_body()
 
 	if TEE then
 		frame_rows[frame] = take_delta()
+		if in_rows then frame_in_rows[frame] = in_rows end
 		if frame >= FRAMES then
 			write_session()
 			io.stdout:flush()
