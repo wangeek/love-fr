@@ -35,6 +35,7 @@
 #include "opengl/Graphics.h"
 
 #include "fr/fr_capture.h"
+#include "fr/fr_statediff.h"
 
 #include <cassert>
 #include <cstring>
@@ -189,6 +190,12 @@ int w_discard(lua_State *L)
 
 int w_present(lua_State *L)
 {
+	// B6 堆 CRC 档（常开）：present 时刻（帧 commit 点）全堆 GCtab 确定性
+	// 序 CRC 入当帧缓存——end 段 s_crc 数据源。无窗也采（tee 无头/有窗
+	// 逐字节一致锚；堆遍历纯字节读无 GL 依赖，红线见 fr_statediff.h）。
+	if (fr::capture_enabled())
+		fr::capture_state_crc(L);
+
 	// B4-2 回放钩：present 前把行缓冲回放到当前渲染目标（屏幕显示的是回放结果，
 	// D8 语义替代）。回放幂等（缓冲全会话累积不消费，见 fr_capture.h）。
 	// 无窗（拓扑 C 无头，FR_HEADLESS=1）时 isCreated()=false——回放需要渲染
@@ -3079,7 +3086,10 @@ static const luaL_Reg functions[] =
 	{ "_frReplay", fr::w_frReplay },
 	{ "_frNewCanvasReal", fr::w_frNewCanvasReal },
 	{ "_frImageDataCRC", fr::w_frImageDataCRC },
+	{ "_frCanvasProbe", fr::w_frCanvasProbe },
 	{ "_frOfflineReplay", fr::w_frOfflineReplay },
+	{ "_frStateCRC", fr::w_frStateCRC },     // B6：堆 CRC 显式出口（验证帧/sim）
+	{ "_frTakeSCrcs", fr::w_frTakeSCrcs },   // B6：每帧 s_crc 数组（end 段组装）
 
 	{ "newImage", w_newImage },
 	{ "newArrayImage", w_newArrayImage },

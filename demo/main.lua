@@ -27,12 +27,14 @@
 -- tee₁ 会话写出（Task 4）：--out <path> 存在即启用 tee 模式——会话末组装 .fr
 -- 文本写文件（UTF-8/LF，末尾单 LF）。组装口径复用 l0/main.lua 的成熟结构：
 -- 头行 `frb1 640 480 <sha> base <seed>` + cmnt 固定文本 + 帧块（帧内行序
--- dt → 资产（仅 frame 0，checkpoint 注入口径）→ in 事件行 → out 捕获行）。
--- C 捕获层当前不产 st/s_crc/d_crc 行（会话级校验归 B6 堆遍历）——**本会话为
--- out-only 形态，end 段缺省**。参数：--frames N（缺省 4）、--sha <64hex>
+-- dt → 资产（仅 frame 0，checkpoint 注入口径）→ in 事件行 → out 捕获行
+-- → end 段 s_crc）。参数：--frames N（缺省 4）、--sha <64hex>
 --（cmd.tbl 指纹，调用侧算好传入；缺/坏报错 exit 2，L0 同款）、--seed n
 --（缺省 0）。确定性：FIXED_DT 固定 + cmnt 固定 + 无随机 → 两次运行逐字节
 -- 一致（测试锚）。验证帧（frame 3）的 Canvas 回读与 tee 并存：先验证后 tee。
+-- B6 Task 1（end 段 s_crc）：present 时刻 C 侧全堆 GCtab 确定性序 CRC
+--（fr_statediff——验证帧与 sim 循环显式调 _frStateCRC，两路径同一 C
+-- 遍历）；帧块尾 `s_crc <u32十进制>`。d_crc 本批不加（口径归 Task 3）。
 --
 -- B5 Task 1（事件捕获 + 事件驱动化）：poll 循环不再丢弃——白名单内离散输入
 -- 事件逐条记 ev 行进当帧 in 缓冲（Lua 侧拼行，格式源对齐 l0/fr.lua 的
@@ -44,6 +46,12 @@
 -- in 段为空。注入脚本 --inject-click <x>,<y>（帧 1）/ --inject-key <key>
 --（帧 2）：帧首 push、poll 前——同帧取出（帧号 = 帧块号 0-based）。
 local kernel = require("kernel")
+
+-- B6 确定性前提：关 JIT 编译（解释执行）。JIT 起编时机随热点计数漂移
+--（验证帧的回读循环会把阈值提前推过线——窗口/无头两侧不同帧起编，
+-- trace 元数据表进堆让 s_crc 跨模式不可比，实测定位）。捕获 rig 以
+-- 确定性优先，4 帧跑分无关性能。
+if jit then jit.off() end
 
 local FIXED_DT = 0.016667
 -- 拓扑 C 无头（B4 阶段三 Task 4）：FR_HEADLESS=1 + conf.lua t.window=false。
@@ -268,7 +276,11 @@ end
 local VERIFY_FRAME = 3
 local frame = 0
 
--- 验证帧自证：三点像素回读（背景黑 / 方块区真红物化 / 红条红）+ 汇总行。
+-- 验证帧自证：三点像素回读 + 汇总 + D_CRC。回读环整体在 C 侧
+--（_frCanvasProbe：PIXEL/PIXELS/D_CRC 行 stdout 与旧 Lua 环逐字节同构；
+-- 三采样点/期望色是 rig 常量，落 C——B6 实测：Lua 侧 getPixel/format/
+-- print 环在验证帧留 live 残留表，污染末帧 s_crc 的窗口/无头一致性，
+-- Canvas/setCanvas/draw/_frReplay 路径实测无残留）。
 local function verify_frame()
 	-- 真 Canvas 开关无关（语义替代版不建真 Canvas，见 fr_capture.h 边界）；
 	-- _frNewCanvasReal 定 dpiScale=1（像素域=逻辑域）。
@@ -277,24 +289,7 @@ local function verify_frame()
 	love.draw()                 -- 捕获模式：记录行（真执行被抑制）；关闭模式：真画
 	love.graphics._frReplay()   -- 捕获模式：行缓冲回放到 canvas；关闭模式：空缓冲 no-op
 	love.graphics.setCanvas()   -- 先解绑：active Canvas 不许 newImageData（11.5 实测报错）
-	local img = c:newImageData()
-	local pts = {
-		{ 400, 100, 0, 0, 0 },       -- 背景（黑 clear）
-		{ 20, 30, 255, 0, 0 },       -- 方块区（hero 11,20 起 32x32；真字节物化=真红）
-		{ 320, 468, 255, 0, 0 },     -- 红条（0,456,640,24 fill）
-	}
-	local npass = 0
-	for _, p in ipairs(pts) do
-		local r, g, b = img:getPixel(p[1], p[2])
-		r, g, b = math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5)
-		print(string.format("PIXEL %d %d %d %d %d", p[1], p[2], r, g, b))
-		if r == p[3] and g == p[4] and b == p[5] then npass = npass + 1 end
-	end
-	print(string.format("PIXELS %d %d", #pts, npass))
-	-- D_CRC（B4 阶段三 Task 3）：验证帧画布全字节 CRC32（_frImageDataCRC
-	-- 与离线回放同一 C 采集函数）——拓扑 B 对拍锚：离线回放同一流文件的
-	-- `D_CRC 3`（前 3 帧块执行后的画布）与本行同值。tee/非 tee 都打。
-	print(string.format("D_CRC %d %d", frame, love.graphics._frImageDataCRC(img)))
+	love.graphics._frCanvasProbe(c, frame)
 	-- 会话行（测试判据）：资产行 + out 段行（clear/draw/print/rect）。
 	-- tee 模式不在此打印/退出：验证帧捕获行归本帧 delta，会话末统一组装写
 	-- 文件（Task 4：Canvas 回读与 tee 并存，先验证后 tee）。
@@ -317,6 +312,7 @@ local function write_session()
 		"cmnt fork capture rig session",
 	}
 	local assets = love.graphics._frTakeAssets()
+	local scrcs = love.graphics._frTakeSCrcs()   -- B6：每帧堆 CRC（end 段）
 	for f = 1, frame do
 		parts[#parts + 1] = ("frame %d"):format(f - 1)
 		parts[#parts + 1] = ("dt %.6f"):format(FIXED_DT)
@@ -329,6 +325,11 @@ local function write_session()
 			for _, row in ipairs(ins) do parts[#parts + 1] = row end
 		end
 		for _, row in ipairs(frame_rows[f]) do parts[#parts + 1] = row end
+		-- B6 Task 1：end 段 s_crc（帧块尾，out 行后；cmd.tbl end 段
+		-- crc u32，十进制 canonical）。d_crc 本批不加——Canvas 回读 CRC
+		-- 与 tee 并存的口径归 Task 3 定，如实登记（end 段暂只有 s_crc）。
+		assert(scrcs[f] ~= nil, "fr-demo: 帧 " .. tostring(f) .. " 缺 s_crc（收集钩缺席？）")
+		parts[#parts + 1] = ("s_crc %d"):format(scrcs[f])
 	end
 	local fh = assert(io.open(OUT_PATH, "wb"))
 	fh:write(table.concat(parts, "\n") .. "\n")
@@ -350,29 +351,36 @@ local function frame_body()
 		end
 
 		love.event.pump()
-		-- poll 逐条取全参（poll_i 返回 name+全部存储参数，无 5 参上限——
-		-- generic for 的 a,b,c,d,e 绑定反而截尾，故 table 收全）。
+		-- poll 逐条收 6 局部（name + 5 参：白名单事件最大 5 参——
+		-- mousepressed x y button istouch presses）。不建 { pi() } 表：
+		-- 环境事件（focus/mousemoved…）窗口版每帧多条、无头版为零，
+		-- 表垃圾进 GC 链会让 s_crc 随窗口/无头模式漂移（B6 堆口径的
+		-- 确定性前提）；参数列中无 nil（love 事件载荷不含 nil），尾部
+		-- nil 计数即 argc。
 		local pi = love.event.poll()
 		local slot = 0
 		while true do
-			local ev = { pi() }
-			local name = ev[1]
+			local name, e1, e2, e3, e4, e5 = pi()
 			if name == nil then break end
 			if name == "quit" then
 				return 0
 			end
 			if IN_EVENTS[name] then
-				local argc = #ev - 1
+				local argc = e5 ~= nil and 5 or e4 ~= nil and 4 or e3 ~= nil and 3
+					or e2 ~= nil and 2 or e1 ~= nil and 1 or 0
 				local toks = { ('ev %d "%s" 0 %d'):format(slot, esc(name), argc) }
-				for i = 2, #ev do
-					toks[#toks + 1] = tok_variant(ev[i])
-				end
+				if argc >= 1 then toks[#toks + 1] = tok_variant(e1) end
+				if argc >= 2 then toks[#toks + 1] = tok_variant(e2) end
+				if argc >= 3 then toks[#toks + 1] = tok_variant(e3) end
+				if argc >= 4 then toks[#toks + 1] = tok_variant(e4) end
+				if argc >= 5 then toks[#toks + 1] = tok_variant(e5) end
 				slot = slot + 1
 				in_rows = in_rows or {}
 				in_rows[#in_rows + 1] = table.concat(toks, " ")
 				-- 分发（poll 快照逐条、当帧完成）：有则调，无则只记录
+				--（尾部 nil 多传无害——handler 只取前缀参）
 				local h = kernel.handlers[name]
-				if h then h(unpack(ev, 2)) end
+				if h then h(e1, e2, e3, e4, e5) end
 			end
 		end
 	end
@@ -385,6 +393,13 @@ local function frame_body()
 	-- 无头（拓扑 C）跳过验证帧——Canvas 回读是 GL 依赖点（探针定论）；本帧
 	-- 捕获行走常规 love.draw() 路径，与有窗版逐字节同源（tee 一致性锚）。
 	if frame == VERIFY_FRAME and not HEADLESS then
+		-- B6 堆 CRC：验证帧不走 present（w_present 钩不触发），显式等价
+		-- 收集——与 present 钩同一 C 遍历；collectgarbage 同 present 路径
+		--（live 堆快照口径）；收集点在本位与 verify 后无差（verify/draw
+		-- 不分配 GCtab，见 VERIFY_PTS 提升注）。无头本帧走 present 钩，
+		-- 两侧每帧恰一份。
+		collectgarbage("collect")
+		love.graphics._frStateCRC()
 		-- 精确一次（tee 模式循环延续到 FRAMES，>= 会在后续帧重复验证）；
 		-- 非 tee：内部 exit(0)；tee：Canvas 验证后返回。
 		verify_frame()
@@ -394,6 +409,11 @@ local function frame_body()
 	if not verified then
 		if love.graphics then
 			love.draw()
+			-- B6：present 前清垃圾——s_crc 是 live 堆快照：未清扫的死表
+			-- 会随 OS 事件 interning 量抖动清扫时机（实测双跑偶发漂移），
+			-- 收集前 collectgarbage 把噪声挡在快照外（公开 API，非 statediff
+			-- 层行为——C 遍历保持只读红线）。
+			collectgarbage("collect")
 			love.graphics.present() -- 捕获模式：w_present 钩先回放后上屏
 		end
 	end
@@ -499,10 +519,11 @@ local function parse_ev_row(line)
 	return { name = name, args = args }
 end
 
--- 流解析：.fr 文本 → 帧表 {{dt=num, ev={{name,args}}, out={行}}}。
--- 分类按本 rig 会话组装口径：首帧块前只许 frb1/cmnt；帧块内 dt/asset/ev
--- 归类（asset 行跳过——sim 侧 register_assets 同序重建，不比对），其余整行
--- 进 out（与再生行逐字节比对）。
+-- 流解析：.fr 文本 → 帧表 {{dt=num, ev={{name,args}}, out={行}, scrc=num}}。
+-- 分类按本 rig 会话组装口径：首帧块前只许 frb1/cmnt；帧块内 dt/asset/ev/
+-- s_crc 归类（asset 行跳过——sim 侧 register_assets 同序重建，不比对；
+-- s_crc=B6 end 段堆 CRC，收集后与重演侧逐帧比对），其余整行进 out
+--（与再生行逐字节比对）。
 local function parse_stream(path)
 	local fh, e = io.open(path, "rb")
 	if not fh then
@@ -538,6 +559,14 @@ local function parse_stream(path)
 			cur.dt = v
 		elseif op == "asset" then
 			-- 资产行：sim 侧 register_assets 重建（顺序/内容与录制同源）
+		elseif op == "s_crc" then
+			-- B6 end 段堆 CRC：收集进帧表（录制侧值），旧流无此行则留 nil
+			local v = line:match("^s_crc (%d+)$")
+			if not v then
+				io.stderr:write("fr-demo: s_crc 行非法：", line, "\n")
+				os.exit(2)
+			end
+			cur.scrc = tonumber(v)
 		elseif op == "ev" then
 			cur.ev[#cur.ev + 1] = parse_ev_row(line)
 		else
@@ -594,6 +623,11 @@ if SIM_PATH then
 			-- ③ update 吃录制 dt → draw 捕获再生行
 			kernel.update(fr.dt)
 			kernel.draw(ir_graphics)
+			-- B6 堆 CRC：present 等价点收集（录制侧在 present 钩、take_delta
+			-- 前——同序：take_delta 的表分配不进本帧比对值）。
+			-- collectgarbage 同录制侧口径（live 堆快照）。
+			collectgarbage("collect")
+			local scrc = love.graphics._frStateCRC()
 			local gen = take_delta()
 			-- ④ 比对：ev 条数漂移（push/poll 往返丢失或 OS 噪声混入）+ 逐行位置差
 			local ndiff, first_rec, first_gen = 0, nil, nil
@@ -616,6 +650,13 @@ if SIM_PATH then
 				nmis = nmis + 1
 				print(("SIM %d MISMATCH %d | REC: %s | GEN: %s")
 					:format(fi - 1, ndiff, first_rec, first_gen))
+			end
+			-- B6：堆 CRC 重演比对（独立于 out 行——内核状态重演全对的自证；
+			-- 旧流无 s_crc 行则 skip，不作判定）。
+			if fr.scrc == nil then
+				print(("SIM_CRC %d skip"):format(fi - 1))
+			else
+				print(("SIM_CRC %d %s"):format(fi - 1, scrc == fr.scrc and "ok" or "mis"))
 			end
 		end
 		local rc2 = nmis == 0 and 0 or 1

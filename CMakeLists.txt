@@ -608,6 +608,8 @@ set(LOVE_SRC_MODULE_GRAPHICS_ROOT
 # selftest 不入 love 目标（其 main() 冲突）；.c 混入 CXX 目标显式钉 LANGUAGE C，
 # /utf-8 防中文注释在非 UTF-8 代码页（MSVC 默认 ACP）下的 C4819 警告。
 # B4 阶段三：fr_materialize（真纹理物化器，手写层——真源 fr_materialize.h 注释）。
+# B6：fr_statediff（堆 CRC 档，手写层——真源 fr_statediff.h 注释；直 include
+# LuaJIT 内部头 lj_obj.h，include 路径走 MEGA 构建的 MEGA_LUAJIT_INCLUDE）。
 set(LOVE_SRC_MODULE_GRAPHICS_FR
 	src/modules/graphics/fr/fr_codec.c
 	src/modules/graphics/fr/fr_codec.h
@@ -615,6 +617,8 @@ set(LOVE_SRC_MODULE_GRAPHICS_FR
 	src/modules/graphics/fr/fr_capture.h
 	src/modules/graphics/fr/fr_materialize.cpp
 	src/modules/graphics/fr/fr_materialize.h
+	src/modules/graphics/fr/fr_statediff.cpp
+	src/modules/graphics/fr/fr_statediff.h
 )
 set_source_files_properties(src/modules/graphics/fr/fr_codec.c PROPERTIES LANGUAGE C)
 # fr_capture.cpp / fr_materialize.cpp 为手写层（真源见各自 .h 注释）；
@@ -624,6 +628,7 @@ set_source_files_properties(src/modules/graphics/fr/fr_codec.c PROPERTIES LANGUA
 if(MSVC)
 	set_source_files_properties(src/modules/graphics/fr/fr_capture.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
 	set_source_files_properties(src/modules/graphics/fr/fr_materialize.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
+	set_source_files_properties(src/modules/graphics/fr/fr_statediff.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
 	set_source_files_properties(src/modules/graphics/wrap_Graphics.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
 endif()
 if(MSVC)

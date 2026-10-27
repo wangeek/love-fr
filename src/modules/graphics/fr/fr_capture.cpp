@@ -740,28 +740,39 @@ int w_frNewCanvasReal(lua_State *L)
 
 // CRC32（l0/walker.lua 同构：查表 0xEDB88320、init/xorout 0xFFFFFFFF、
 // reflected；空输入 = 0）。live 验证帧（w_frImageDataCRC）与离线回放
-// 共用本函数——对拍锚的"同采集函数"。
-static love::uint32 crc32_bytes(const void *data, size_t n)
+// 共用一次性外壳 fr_crc32_bytes——对拍锚的"同采集函数"；增量入口
+// fr_crc32_update 供 fr_statediff 分段混入（B6 堆 CRC 与 D_CRC 同一
+// CRC32 机，勿改参数语义）。
+static love::uint32 *crc32_table()
 {
-	static love::uint32 table[256];
-	static bool ready = []()
+	static love::uint32 *table = []()
 	{
+		static love::uint32 tbl[256];
 		for (int i = 0; i < 256; i++)
 		{
 			love::uint32 c = (love::uint32) i;
 			for (int k = 0; k < 8; k++)
 				c = (c & 1u) ? (c >> 1) ^ 0xEDB88320u : (c >> 1);
-			table[i] = c;
+			tbl[i] = c;
 		}
-		return true;
+		return tbl;
 	}();
-	(void) ready;
+	return table;
+}
 
+love::uint32 fr_crc32_update(love::uint32 state, const void *data, size_t n)
+{
+	const love::uint32 *table = crc32_table();
 	const love::uint8 *p = (const love::uint8 *) data;
-	love::uint32 crc = 0xFFFFFFFFu;
+	love::uint32 crc = state;
 	for (size_t i = 0; i < n; i++)
 		crc = (crc >> 8) ^ table[(crc ^ p[i]) & 0xFFu];
-	return crc ^ 0xFFFFFFFFu;
+	return crc;
+}
+
+love::uint32 fr_crc32_bytes(const void *data, size_t n)
+{
+	return fr_crc32_update(0xFFFFFFFFu, data, n) ^ 0xFFFFFFFFu;
 }
 
 // 离线会话：头几何 + 每帧 out 行（资产在解析期直接入登记表）。
@@ -887,6 +898,8 @@ static int offline_parse_text(const std::string &buf, OfflineSession &s)
 		}
 		if (ln.compare(0, 3, "dt ") == 0)
 			continue; // 离线无 kernel，dt 只跳过
+		if (ln.compare(0, 6, "s_crc ") == 0)
+			continue; // 同上：s_crc 是内核堆快照，离线无 kernel 只跳过（B6）
 		if (ln.compare(0, 6, "asset ") == 0)
 		{
 			if (!offline_register_asset_text(ln, no))
@@ -933,6 +946,10 @@ static int offline_parse_frame_body(const love::uint8 *body, size_t n, size_t ba
 		{
 		case FR_OP_DT:
 			(void) fr_dec_f32(&d); // 无 kernel，dt 只消费
+			break;
+		case FR_OP_S_CRC:
+			// 无 kernel，堆快照 CRC 只消费（B6：tee 会话 end 段行放行）。
+			(void) fr_dec_u32(&d);
 			break;
 		case FR_OP_ASSET:
 			if (d.asset_kind == FR_ASSET_KIND_IMAGE)
@@ -1185,7 +1202,7 @@ int fr_offline_replay(const char *path, love::graphics::Graphics *gfx)
 			// D_CRC n = 前 n 个帧块执行后的画布 CRC（live 验证帧计数同口径：
 			// live 第 3 帧回读时行缓冲恰为前 3 帧块）。
 			std::printf("D_CRC %d %u\n", (int) fi + 1,
-			            crc32_bytes(img->getData(), img->getSize()));
+			            fr_crc32_bytes(img->getData(), img->getSize()));
 
 			if (fi + 1 == s.frames.size())
 			{
@@ -1219,8 +1236,44 @@ int fr_offline_replay(const char *path, love::graphics::Graphics *gfx)
 int w_frImageDataCRC(lua_State *L)
 {
 	love::image::ImageData *img = love::luax_checktype<love::image::ImageData>(L, 1);
-	lua_pushinteger(L, (lua_Integer) crc32_bytes(img->getData(), img->getSize()));
+	lua_pushinteger(L, (lua_Integer) fr_crc32_bytes(img->getData(), img->getSize()));
 	return 1;
+}
+
+// 验证帧三点回读 + 汇总 + D_CRC（B6 下沉 C 侧，行格式与原 Lua 环逐字节
+// 同构：`PIXEL x y r g b`×3 + `PIXELS 3 n` + `D_CRC <frame> <crc>`）。
+// 三采样点/期望色 = 既有像素判据锚（tests/test_capture._POINTS 同源），
+// rig 常量落 C；换算 = getPixel 的 0-1 浮点 × floor(c*255+0.5)。
+int w_frCanvasProbe(lua_State *L)
+{
+	love::graphics::Canvas *c = love::luax_checktype<love::graphics::Canvas>(L, 1);
+	int frameno = (int) luaL_optinteger(L, 2, 0);
+
+	love::image::Image *imagemod =
+		love::Module::getInstance<love::image::Image>(love::Module::M_IMAGE);
+	love::Rect rect = {0, 0, c->getPixelWidth(), c->getPixelHeight()};
+	love::image::ImageData *img = nullptr;
+	love::luax_catchexcept(L, [&]() { img = c->newImageData(imagemod, 0, 0, rect); });
+
+	static const int pts[3][2] = {{400, 100}, {20, 30}, {320, 468}};
+	static const int want[3][3] = {{0, 0, 0}, {255, 0, 0}, {255, 0, 0}};
+	int npass = 0;
+	for (int k = 0; k < 3; k++)
+	{
+		love::Colorf col = img->getPixel(pts[k][0], pts[k][1]);
+		int r = (int) std::floor(col.r * 255.0f + 0.5f);
+		int g = (int) std::floor(col.g * 255.0f + 0.5f);
+		int b = (int) std::floor(col.b * 255.0f + 0.5f);
+		std::printf("PIXEL %d %d %d %d %d\n", pts[k][0], pts[k][1], r, g, b);
+		if (r == want[k][0] && g == want[k][1] && b == want[k][2])
+			npass++;
+	}
+	std::printf("PIXELS %d %d\n", 3, npass);
+	std::printf("D_CRC %d %u\n", frameno,
+	            fr_crc32_bytes(img->getData(), img->getSize()));
+	std::fflush(stdout);
+	img->release();
+	return 0;
 }
 
 int w_frOfflineReplay(lua_State *L)

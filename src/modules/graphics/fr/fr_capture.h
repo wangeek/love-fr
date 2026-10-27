@@ -78,6 +78,13 @@ enum FrAssetKind
 // FR_CAPTURE=1 开启；env 只在首次调用读一次并缓存（启动口径）。
 bool capture_enabled();
 
+// CRC32（l0/walker.lua 同构：查表 0xEDB88320、reflected、init/xorout
+// 0xFFFFFFFF；空输入 = 0）。一次性外壳为 D_CRC 对拍锚（live 验证帧与
+// 离线回放同一采集语义，勿改）；增量入口供 fr_statediff 逐段混入（同
+// 一查表实现——堆 CRC 与 D_CRC 同一 CRC32 机）。
+love::uint32 fr_crc32_update(love::uint32 state, const void *data, size_t n);
+love::uint32 fr_crc32_bytes(const void *data, size_t n);
+
 // w_clear 挂钩记录点：真执行的抑制由调用方（wrap_Graphics.cpp）提前 return
 // 负责，本函数只记录。颜色分量域 0-1 浮点 → rgba8 整数。
 void capture_clear(const love::graphics::OptionalColorf &color,
@@ -157,12 +164,17 @@ love::uint32 fr_assetid(lua_State *L, int idx);
 //       回读 rig 专用——语义替代版不建真 Canvas，见文件头 Canvas 边界）；
 //   love.graphics._frImageDataCRC(img) → ImageData 全字节 CRC32（live
 //       验证帧 D_CRC 与离线回放同一采集函数，对拍锚）；
+//   love.graphics._frCanvasProbe(canvas[, frame]) → 验证帧三点像素回读
+//       + PIXELS 汇总 + D_CRC（B6：整环 C 侧 printf，stdout 行与原 Lua
+//       环逐字节同构——Lua 侧 getPixel/format/print 在验证帧留 live 残留
+//       表，污染末帧 s_crc 的窗口/无头一致性，实测定位）；
 //   love.graphics._frOfflineReplay(path) → fr_offline_replay 的 rc。
 int w_frTakeSession(lua_State *L);
 int w_frTakeAssets(lua_State *L);
 int w_frReplay(lua_State *L);
 int w_frNewCanvasReal(lua_State *L);
 int w_frImageDataCRC(lua_State *L);
+int w_frCanvasProbe(lua_State *L);
 int w_frOfflineReplay(lua_State *L);
 
 } // fr
