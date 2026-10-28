@@ -243,6 +243,18 @@ love::graphics::Font *fr_materialize_font(love::graphics::Graphics *gfx, love::u
 		warn_once(id, "非 font 资产");
 		return nullptr;
 	}
+	// B12+ 字节引用（v1.2.7 池化）：data_hex 空且 font_src>0 → 取源资产字节
+	//（源必为自有字节者——登记侧保证不链式），size 用本行（光栅化参数）。
+	if (info.data_hex.empty() && info.font_src != 0)
+	{
+		FrAssetInfo src;
+		if (!fr_lookup_asset(info.font_src, src) || src.data_hex.empty())
+		{
+			warn_once(id, "font 引用源无字节");
+			return nullptr;
+		}
+		info.data_hex = src.data_hex;
+	}
 	if (info.size <= 0.0f || info.data_hex.empty())
 	{
 		warn_once(id, "无真字节登记");

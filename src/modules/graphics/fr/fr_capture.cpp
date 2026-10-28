@@ -604,7 +604,9 @@ struct FrAsset
 	int w = 0, h = 0;                 // image / canvas
 	float size = 0.0f;                // font
 	float qx = 0, qy = 0, qw = 0, qh = 0, qsw = 0, qsh = 0; // quad
-	std::string data_hex;             // image / font（空 = "-"）
+	std::string data_hex;             // image / font（空 = "-" 或 "=N" 引用）
+	// B12+：font 字节引用（同 TTF 跨字号；0 = 自有字节）。行文本 "=N"。
+	love::uint32 font_src = 0;
 	// B9 代理态（不进协议行）：采样参数属渲染实现细节（D10），代理方法
 	// setFilter/getFilter 的承载；默认 linear/linear（11.5 新图缺省同 love
 	// 缺省 filter 族）。
@@ -649,7 +651,16 @@ static std::string render_asset_row(const FrAsset &a)
 	if (a.kind == FR_ASSET_IMAGE)
 		snprintf(head, sizeof(head), "asset image %u %d %d ", a.id, a.w, a.h);
 	else
+	{
+		// B12+ 字节引用形态（同 TTF 跨字号）：hex 位 "=N"（v1.2.7 池化）。
+		if (a.font_src != 0)
+		{
+			snprintf(head, sizeof(head), "asset font %u %.6f =%u",
+			         a.id, a.size, a.font_src);
+			return head;
+		}
 		snprintf(head, sizeof(head), "asset font %u %.6f ", a.id, a.size);
+	}
 	return std::string(head) + (a.data_hex.empty() ? "-" : a.data_hex);
 }
 
@@ -972,28 +983,45 @@ static love::uint32 s_current_font = 0;
 void fr_set_current_font(love::uint32 id) { s_current_font = id; }
 love::uint32 fr_current_font() { return s_current_font; }
 
-static love::uint32 register_asset(const FrAsset &a)
+static love::uint32 register_asset(const FrAsset &in)
 {
+	// 可变工作件（font 引用化要改 font_src/data_hex——入参 const）。
+	FrAsset a = in;
 	// B9 资源爆炸对策①——不可变资产去重：image/font/quad 内容由参数全决
 	//（字节/几何），同参重建 = 同一资产（游戏侧多 cache 重复创建的兜底，
 	// 典型：font.lua 多处 M.get(size) 各自建、tileset 多处 newImage 同路径）
 	//——复用既有 id，不重复产行。**canvas 永不去重**：可变渲染目标，同尺寸
 	// 内容独立（world_map fog/minimap 两块同参 canvas 是两个资产）。
+	// B12+ font 字节池化：同字节跨 size 不复用 id（print 行按 (id) 引用，
+	// 字号是物化参数必须区分）——但字节不重复存：新 id + font_src 引用源
+	//（asset 行 "=N" 形态，物化端复用源字节按本行 size 光栅化）。
 	if (a.kind != FR_ASSET_CANVAS)
 	{
 		for (const auto &e : assets())
 		{
-			if (e.kind != a.kind || e.w != a.w || e.h != a.h)
+			if (e.kind != a.kind || e.data_hex != a.data_hex)
 				continue;
-			if (e.kind == FR_ASSET_FONT && e.size != a.size)
-				continue;
+			if (a.kind == FR_ASSET_IMAGE || a.kind == FR_ASSET_FONT)
+			{
+				if (e.w != a.w || e.h != a.h)
+					continue;
+				if (a.kind == FR_ASSET_FONT && e.size == a.size)
+					return e.id; // 全等（字节+字号）→ 同一资产
+				if (a.kind == FR_ASSET_FONT)
+				{
+					// 同字节跨字号 → 新 id + 引用（下方落）
+					a.font_src = e.font_src != 0 ? e.font_src : e.id; // 源链化到首个
+					a.data_hex.clear();
+					break;
+				}
+				return e.id; // image 全等复用
+			}
 			if (e.kind == FR_ASSET_QUAD
 			    && (e.qx != a.qx || e.qy != a.qy || e.qw != a.qw || e.qh != a.qh
 			        || e.qsw != a.qsw || e.qsh != a.qsh))
 				continue;
-			if (e.data_hex != a.data_hex)
-				continue;
-			return e.id;
+			if (e.kind == FR_ASSET_QUAD)
+				return e.id;
 		}
 	}
 	assets().push_back(a);
@@ -1025,6 +1053,7 @@ bool fr_lookup_asset(love::uint32 id, FrAssetInfo &out)
 		out.h = a.h;
 		out.size = a.size;
 		out.data_hex = a.data_hex;
+		out.font_src = a.font_src;
 		return true;
 	}
 	return false;
@@ -1033,7 +1062,8 @@ bool fr_lookup_asset(love::uint32 id, FrAssetInfo &out)
 // 流内资产登记（拓扑 B 离线回放）：id 取流行，不重编号；只入登记表
 //（物化器消费），不入 asset_rows（离线不回产会话文本）。
 bool fr_register_stream_asset(int kind, love::uint32 id, int w, int h, float size,
-                              const float *quad, const std::string &data_hex)
+                              const float *quad, const std::string &data_hex,
+                              love::uint32 font_src)
 {
 	if (id == 0)
 		return false; // 0 = 空资产哨兵，不可登记
@@ -1050,6 +1080,7 @@ bool fr_register_stream_asset(int kind, love::uint32 id, int w, int h, float siz
 		a.qh = quad[3]; a.qsw = quad[4]; a.qsh = quad[5];
 	}
 	a.data_hex = data_hex;
+	a.font_src = font_src; // B12+：font 字节引用（离线解析 "=N" 形态）
 	assets().push_back(a);
 	return true;
 }
@@ -1826,6 +1857,15 @@ static int offline_register_asset_text(const std::string &row, int lineno)
 		hex = row.substr((size_t) pos);
 		if (hex == "-")
 			hex.clear();
+		// B12+ 字节引用形态（v1.2.7 池化）："=N" → font_src（hex 置空）。
+		if (hex.size() >= 2 && hex[0] == '=')
+		{
+			unsigned src = 0;
+			if (sscanf(hex.c_str(), "=%u", &src) != 1 || src == 0)
+				return 0;
+			return fr_register_stream_asset(FR_ASSET_FONT, id, 0, 0, size,
+			                                nullptr, "", src) ? 1 : 0;
+		}
 		if (!hex_valid(hex))
 			return 0;
 		return fr_register_stream_asset(FR_ASSET_FONT, id, 0, 0, size, nullptr, hex) ? 1 : 0;
@@ -2003,7 +2043,27 @@ static int offline_parse_frame_body(const love::uint8 *body, size_t n, size_t ba
 			{
 				love::uint32 id = fr_dec_u32(&d);
 				float size = fr_dec_f32(&d);
-				(void) fr_dec_u32(&d); // data 长度
+				love::uint32 n = fr_dec_u32(&d); // data 长度
+				// B12+ 引用形态（v1.2.7 池化）：len=0xFFFFFFFF + u32 src——
+				// 复用源资产 TTF 字节。src 裸读（类型表该位是 DATA，走
+				// fr_dec_u32 会 TYPE 错；字段计数清零防 fr_dec_next 的
+				// ROW 检查——本行到此读完）。
+				if (n == 0xFFFFFFFF)
+				{
+					love::uint32 src = 0;
+					if (d.off + 4 > d.len)
+					{
+						std::fprintf(stderr, "fr-offline: off %d：font 引用 src 截断\n",
+						             (int) (base + d.off));
+						return 3;
+					}
+					std::memcpy(&src, d.p + d.off, 4);
+					d.off += 4;
+					d.nfields = 0;
+					fr_register_stream_asset(FR_ASSET_FONT, id, 0, 0, size,
+					                         nullptr, "", src);
+					break;
+				}
 				const love::uint8 *p = nullptr;
 				love::uint32 len = 0;
 				if (fr_dec_data(&d, &p, &len) != 0)

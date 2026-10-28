@@ -150,6 +150,11 @@ function kernel.draw_api(g, assets)
 	-- B9 blend 边界（battle 形态：add 后复位 alpha）
 	lg.setBlendMode("add")
 	lg.setBlendMode("alpha")
+	-- B12+ font 字节池化自证：5 号（=4 引用，size 14）print 物化（离线回放
+	-- 经引用取源字节光栅化——行在即链路通）
+	lg.setFont(assets[5])
+	lg.print("REF", 260.0, 10.0)
+	lg.setFont(assets[2])
 end
 
 -- 事件处理器（B5 Task 1）：main.lua run loop 的 poll 快照逐条分发直调，

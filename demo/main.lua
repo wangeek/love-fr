@@ -298,6 +298,8 @@ local function register_assets()
 	if os.getenv("FR_CAPTURE") == "1" then
 		local fd = love.filesystem.newFileData(("\0\1\2\3"):rep(8), "fake.ttf")
 		FR_ASSETS[4] = love.graphics.newFont(fd, 12)
+		-- B12+ 字节池化自证：同字节异 size → 引用形态 asset font 5 ... =4
+		FR_ASSETS[5] = love.graphics.newFont(fd, 14)
 	end
 end
 

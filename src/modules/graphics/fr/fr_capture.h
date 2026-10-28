@@ -154,14 +154,16 @@ void fr_ev_reset_slot();                             // 每帧冲帧后 slot 归
 std::vector<std::string> fr_take_asset_rows();
 
 // 物化侧查表（fr_materialize 用）：登记资产的只读拷贝视图。data_hex 空 =
-// 登记时无字节（"-" 占位，物化不可用）。image 字节口径 = RGBA8 像素
-// （协议约定，非 RGBA8 源资产归后续批次）；font 字节 = TrueType 数据。
+// 登记时无字节（"-" 占位，物化不可用）。image 字节 = 编码文件字节（魔数
+// 判别）或 RGBA8 像素（v1.2.6 双口径）；font 字节 = TrueType 数据，同字节
+// 跨字号走 font_src 引用（v1.2.7 池化——data_hex 此时为 "=N" 行形态）。
 struct FrAssetInfo
 {
 	int kind = 0;
 	int w = 0, h = 0;                 // image / canvas
 	float size = 0.0f;                // font
 	std::string data_hex;             // image / font 真字节 hex（空 = "-"）
+	love::uint32 font_src = 0;        // B12+：font 字节引用源 id（0 = 自有）
 };
 
 // 按 id 查登记资产（未登记 → false）。
@@ -169,9 +171,11 @@ bool fr_lookup_asset(love::uint32 id, FrAssetInfo &out);
 
 // 流内资产登记（拓扑 B 离线回放用）：id 取流行（不重编号），只入登记表
 // 供物化器查表——不入 asset_rows（离线消费流，不回产会话文本）。
-// quad 可为 nullptr（非 quad 资产）；data_hex 空 = "-" 占位（物化不可用）。
+// quad 可为 nullptr（非 quad 资产）；data_hex 空 = "-" 占位（物化不可用）；
+// font_src = font 字节引用源 id（v1.2.7 池化，0 = 自有字节）。
 bool fr_register_stream_asset(int kind, love::uint32 id, int w, int h, float size,
-                              const float *quad, const std::string &data_hex);
+                              const float *quad, const std::string &data_hex,
+                              love::uint32 font_src = 0);
 
 // 拓扑 B 离线回放（B4 阶段三 Task 3）：读 .fr/.frb 会话文件 → 逐帧经
 // capture_exec_row 执行（与 tee₂ 同一行执行路径）→ 每帧末真 Canvas 回读
