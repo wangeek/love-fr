@@ -619,6 +619,8 @@ set(LOVE_SRC_MODULE_GRAPHICS_FR
 	src/modules/graphics/fr/fr_materialize.h
 	src/modules/graphics/fr/fr_statediff.cpp
 	src/modules/graphics/fr/fr_statediff.h
+	src/modules/graphics/fr/fr_session.cpp
+	src/modules/graphics/fr/fr_session.h
 )
 set_source_files_properties(src/modules/graphics/fr/fr_codec.c PROPERTIES LANGUAGE C)
 # fr_capture.cpp / fr_materialize.cpp 为手写层（真源见各自 .h 注释）；
@@ -629,7 +631,13 @@ if(MSVC)
 	set_source_files_properties(src/modules/graphics/fr/fr_capture.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
 	set_source_files_properties(src/modules/graphics/fr/fr_materialize.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
 	set_source_files_properties(src/modules/graphics/fr/fr_statediff.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
+	set_source_files_properties(src/modules/graphics/fr/fr_session.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
 	set_source_files_properties(src/modules/graphics/wrap_Graphics.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
+	# B10：引入 fr_capture.h（UTF-8 中文注释）的新 TU 同样须 /utf-8（同上坑）。
+	set_source_files_properties(src/modules/event/sdl/Event.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
+	set_source_files_properties(src/modules/event/wrap_Event.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
+	set_source_files_properties(src/modules/timer/wrap_Timer.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
+	set_source_files_properties(src/love.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
 endif()
 if(MSVC)
 	set_source_files_properties(src/modules/graphics/fr/fr_codec.c PROPERTIES COMPILE_OPTIONS "/utf-8")

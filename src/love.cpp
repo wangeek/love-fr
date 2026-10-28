@@ -47,7 +47,11 @@ extern "C" {
 
 // FR fork (B9): defined in liblove (fr/fr_materialize.cpp). File-scope
 // declaration – the launcher target has no graphics include paths.
-namespace fr { void fr_materialize_flush(); }
+namespace fr
+{
+void fr_materialize_flush();
+void fr_session_finish(); // B10: FR_OUT session close
+}
 
 #ifdef LOVE_WINDOWS
 extern "C"
@@ -256,6 +260,9 @@ static DoneAction runlove(int argc, char **argv, int &retval)
 	// teardown) hit dead contexts (observed SEGV on third-party exit).
 	// Idempotent; harmless with capture off.
 	fr::fr_materialize_flush();
+	// FR fork (B10): close the FR_OUT session file (text I/O, but finish
+	// here so frame accounting ends with the run).
+	fr::fr_session_finish();
 
 	lua_close(L);
 

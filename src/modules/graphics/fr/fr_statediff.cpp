@@ -273,6 +273,9 @@ static std::vector<love::uint32> &scrcs()
 	return v;
 }
 
+// B10：writer 只读视图（fr_session 冲帧游标自持）。
+const std::vector<love::uint32> &fr_view_scrcs() { return scrcs(); }
+
 void capture_state_crc(lua_State *L)
 {
 	// Task 1b 口径：根已注册 → 子图 CRC；否则全堆回退（dispatch 在
@@ -704,6 +707,9 @@ static std::vector<std::vector<std::string>> &sdiffs()
 	static std::vector<std::vector<std::string>> v;
 	return v;
 }
+
+// B10：writer 只读视图。
+const std::vector<std::vector<std::string>> &fr_view_sdiffs() { return sdiffs(); }
 
 void capture_state_diff(lua_State *L)
 {

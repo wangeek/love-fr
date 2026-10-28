@@ -32,6 +32,7 @@
 #include "audio/Audio.h"
 #include "common/config.h"
 #include "timer/Timer.h"
+#include "graphics/fr/fr_capture.h" // FR fork (B10): in-segment capture at convert
 
 #include <cmath>
 
@@ -132,6 +133,9 @@ void Event::pump()
 		Message *msg = convert(e);
 		if (msg)
 		{
+			// B10：C 侧 in 段捕获（OS 路径 src=0）——convert 即事实源，
+			// 不依赖游戏是否 poll（gap 文档 §三 in 段捕获点原设计）。
+			fr::capture_ev(0, msg->name, msg->args);
 			push(msg);
 			msg->release();
 		}

@@ -22,6 +22,7 @@
 
 // LOVE
 #include "wrap_Timer.h"
+#include "graphics/fr/fr_capture.h" // FR fork (B10): per-frame dt fact source
 
 namespace love
 {
@@ -32,10 +33,12 @@ namespace timer
 
 int w_step(lua_State *L)
 {
-	lua_pushnumber(L, instance()->step());
+	double dt = instance()->step();
+	// B10：帧头 dt 事实源（默认 run loop 每帧恰一次；writer 在 present 取走）。
+	fr::fr_set_pending_dt(dt);
+	lua_pushnumber(L, dt);
 	return 1;
 }
-
 int w_getDelta(lua_State *L)
 {
 	lua_pushnumber(L, instance()->getDelta());

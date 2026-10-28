@@ -495,6 +495,10 @@ local function frame_body()
 		-- 精确一次（tee 模式循环延续到 FRAMES，>= 会在后续帧重复验证）；
 		-- 非 tee：内部 exit(0)；tee：Canvas 验证后返回。
 		verify_frame()
+		-- B10：验证帧不走 present——C 侧 tee（FR_OUT）在此显式补帧（draw
+		-- 已跑、行已入缓冲），帧块序与 Lua tee（write_session）对齐；
+		-- present 钩路径无此需求（第三方游戏 present 天然每帧）。
+		love.graphics._frSessionFrame()
 		verified = true
 	end
 

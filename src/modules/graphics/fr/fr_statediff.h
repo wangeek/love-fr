@@ -130,4 +130,9 @@ int w_frTakeSCrcs(lua_State *L);
 int w_frStateDiffRows(lua_State *L);
 int w_frTakeSDiffRows(lua_State *L);
 
+// B10：writer 只读视图（fr_session 冲帧用；游标归 writer 自持——收集点
+// present 钩每帧恰一份，与收集序同帧纪律）。
+const std::vector<love::uint32> &fr_view_scrcs();
+const std::vector<std::vector<std::string>> &fr_view_sdiffs();
+
 } // fr

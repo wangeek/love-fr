@@ -36,6 +36,7 @@
 
 #include "fr/fr_capture.h"
 #include "fr/fr_statediff.h"
+#include "fr/fr_session.h"
 
 #include <cassert>
 #include <cstring>
@@ -205,6 +206,9 @@ int w_present(lua_State *L)
 		fr::capture_state_crc(L);
 		fr::capture_state_diff(L);
 	}
+
+	// B10：C 侧会话写出（FR_OUT env 触发；写点在 s_crc/st 收集后、回放前）。
+	fr::fr_session_frame(instance());
 
 	// B4-2 回放钩：present 前把行缓冲回放到当前渲染目标（屏幕显示的是回放结果，
 	// D8 语义替代）。回放幂等（缓冲全会话累积不消费，见 fr_capture.h）。
@@ -3331,6 +3335,7 @@ static const luaL_Reg functions[] =
 	{ "_frTakeErrRows", fr::w_frTakeErrRows },   // B8 T4：捕获期 err 行（log 段语义）
 	{ "_frCaptureSuspend", fr::w_frCaptureSuspend }, // B8 T3：观察侧围栏（rig 机器行不进内核流）
 	{ "_frCaptureResume", fr::w_frCaptureResume },
+	{ "_frSessionFrame", fr::w_frSessionFrame },   // B10：显式补帧口（验证帧等价点）
 	{ "_frTakeAssets", fr::w_frTakeAssets },
 	{ "_frReplay", fr::w_frReplay },
 	{ "_frNewCanvasReal", fr::w_frNewCanvasReal },

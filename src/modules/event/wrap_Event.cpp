@@ -24,6 +24,7 @@
 #include "common/runtime.h"
 
 #include "sdl/Event.h"
+#include "graphics/fr/fr_capture.h" // FR fork (B10): push-path capture
 
 // Shove the wrap_Event.lua code directly into a raw string literal.
 static const char event_lua[] =
@@ -81,6 +82,9 @@ int w_push(lua_State *L)
 
 	if (m.get() == nullptr)
 		return 1;
+
+	// B10：注入路径捕获（src=1）——与 OS 路径同一队列同一事实语义。
+	fr::capture_ev(1, m.get()->name, m.get()->args);
 
 	instance()->push(m);
 	return 1;

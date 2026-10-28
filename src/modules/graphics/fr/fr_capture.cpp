@@ -4,11 +4,13 @@
 
 #include "modules/graphics/fr/fr_capture.h"
 #include "modules/graphics/fr/fr_materialize.h"
+#include "modules/graphics/fr/fr_session.h"
 
 // LOVE
 #include "common/Exception.h"
 #include "common/Module.h"
 #include "common/runtime.h"
+#include "common/Variant.h"
 #include "filesystem/Filesystem.h"
 #include "graphics/Canvas.h"
 #include "graphics/Font.h"
@@ -160,6 +162,123 @@ void capture_resume()
 {
 	if (g_suspend > 0)
 		g_suspend--;
+}
+
+// ------------------------------------------------------------------
+// B10：C 侧 in 段捕获 + 帧头 dt 事实源（任意游戏零改动出流）
+// ------------------------------------------------------------------
+
+static std::vector<std::string> &ev_rows()
+{
+	static std::vector<std::string> r;
+	return r;
+}
+
+static int g_ev_slot = 0; // 帧内取号序号（writer 冲帧后归零）
+
+static double g_pending_dt = 0.0;
+static bool g_dt_fresh = false;
+
+void fr_set_pending_dt(double dt)
+{
+	g_pending_dt = dt;
+	g_dt_fresh = true;
+}
+
+bool fr_take_pending_dt(double &out)
+{
+	if (!g_dt_fresh)
+		return false;
+	out = g_pending_dt;
+	g_dt_fresh = false;
+	return true;
+}
+
+const std::vector<std::string> &fr_view_rows() { return rows(); }
+const std::vector<std::string> &fr_view_err_rows() { return err_rows(); }
+const std::vector<std::string> &fr_view_ev_rows() { return ev_rows(); }
+
+void fr_ev_reset_slot()
+{
+	g_ev_slot = 0;
+}
+
+// in 段白名单（与 demo main.lua IN_EVENTS 同集——环境/连续事件不记：
+// mousemoved/focus/visible 随窗口态漂移，进流破 tee 确定性，B5 实测口径）。
+static bool ev_whitelisted(const std::string &name)
+{
+	return name == "keypressed" || name == "keyreleased" || name == "textinput"
+	    || name == "mousepressed" || name == "mousereleased" || name == "wheelmoved";
+}
+
+// Variant → token（demo tok_variant 同构：num %.6f / str "<esc>" / bool 0|1）。
+// 非 num/str/bool 形态（白名单事件不会出现）→ false（调用方跳过整事件）。
+static bool ev_variant_token(const love::Variant &v, std::string &tok)
+{
+	switch (v.getType())
+	{
+	case love::Variant::BOOLEAN:
+		tok = v.getData().boolean ? "bool 1" : "bool 0";
+		return true;
+	case love::Variant::NUMBER:
+	{
+		double d = v.getData().number;
+		if (d != d || d == HUGE_VAL || d == -HUGE_VAL)
+			return false; // NaN/Inf 禁入数值域（fr-spec）
+		char buf[64];
+		snprintf(buf, sizeof(buf), "num %.6f", d);
+		tok = buf;
+		return true;
+	}
+	case love::Variant::STRING:
+	{
+		const love::Variant::SharedString *s = v.getData().string;
+		tok = "str \"" + fr_esc_text(std::string(s->str, s->len)) + "\"";
+		return true;
+	}
+	case love::Variant::SMALLSTRING:
+	{
+		const auto &ss = v.getData().smallstring;
+		tok = "str \"" + fr_esc_text(std::string(ss.str, ss.len)) + "\"";
+		return true;
+	}
+	default:
+		return false;
+	}
+}
+
+void capture_ev(int src, const std::string &name, const std::vector<love::Variant> &args)
+{
+	if (!capture_enabled() || !ev_whitelisted(name))
+		return;
+
+	// 尾部 NIL/UNKNOWN 截断（demo argc 口径 = 最后一个非 nil 实参）；中间
+	// nil 是流格式无法表达的形态（白名单事件不应出现）——整事件跳过+告警。
+	size_t argc = args.size();
+	while (argc > 0 && (args[argc - 1].getType() == love::Variant::NIL
+	                    || args[argc - 1].getType() == love::Variant::UNKNOWN))
+		argc--;
+	std::string row = "ev " + std::to_string(g_ev_slot++)
+	                  + " \"" + fr_esc_text(name) + "\" " + std::to_string(src)
+	                  + " " + std::to_string(argc);
+	for (size_t i = 0; i < argc; i++)
+	{
+		std::string tok;
+		if (!ev_variant_token(args[i], tok))
+		{
+			static bool warned = false;
+			if (!warned)
+			{
+				std::fprintf(stderr, "fr: ev %s 含不可序列化实参（nil/对象），整行跳过\n",
+				             name.c_str());
+				warned = true;
+			}
+			g_ev_slot--;
+			return;
+		}
+		row += " " + tok;
+	}
+	ev_rows().push_back(row);
 }
 
 // ------------------------------------------------------------------
@@ -1500,6 +1619,16 @@ int w_frCaptureSuspend(lua_State *L)
 int w_frCaptureResume(lua_State *L)
 {
 	capture_resume();
+	return 0;
+}
+
+// B10：显式补帧口（demo 验证帧不走 present——rig 自己补调，帧块序完整；
+// 第三方游戏 present 天然每帧，无此需求）。
+int w_frSessionFrame(lua_State *L)
+{
+	love::graphics::Graphics *gfx =
+		love::Module::getInstance<love::graphics::Graphics>(love::Module::M_GRAPHICS);
+	fr_session_frame(gfx);
 	return 0;
 }
 

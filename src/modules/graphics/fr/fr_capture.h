@@ -63,6 +63,11 @@
 
 struct lua_State;
 
+namespace love
+{
+class Variant;
+}
+
 namespace fr
 {
 
@@ -121,6 +126,17 @@ void capture_exec_row(love::graphics::Graphics *gfx, const std::string &row);
 void capture_suspend();
 void capture_resume();
 
+// B10：C 侧 in 段捕获（任意游戏零改动出流的 ev 事实源）。src=0 OS 路径
+//（Event::pump convert 点）/1 注入路径（w_push）。白名单内离散事件记行
+//（与 demo Lua 侧 IN_EVENTS 同集），slot=帧内取号序号；writer 在 present
+// 冲帧后重置计数。capture 关闭时 no-op。
+void capture_ev(int src, const std::string &name, const std::vector<love::Variant> &args);
+
+// B10：帧头 dt 事实源——w_step 钩记录当帧 step() 返回值（默认 run loop
+// 每帧恰一次）；writer 在 present 取走（取走即失效）。
+void fr_set_pending_dt(double dt);
+bool fr_take_pending_dt(double &out);
+
 // B9：SEH 崩溃探针（仅 Windows；FR_CRASH_PROBE=1 时由 present 钩懒装）。
 void fr_install_crash_probe();
 
@@ -128,6 +144,12 @@ void fr_install_crash_probe();
 std::vector<std::string> capture_take_rows();
 // 捕获期 err 行（Shader 边界等，log 段语义；累积拷贝，demo 切 delta）。
 std::vector<std::string> fr_take_err_rows();
+
+// B10：writer 只读视图（fr_session 冲帧用；游标归 writer 自持）。
+const std::vector<std::string> &fr_view_rows();      // out 段
+const std::vector<std::string> &fr_view_err_rows();  // 捕获期 err（log 段）
+const std::vector<std::string> &fr_view_ev_rows();   // in 段（B10 C 侧捕获）
+void fr_ev_reset_slot();                             // 每帧冲帧后 slot 归零
 // 资产行文本（登记序，Task 4 会话组装按 frame 0 checkpoint 注入）。
 std::vector<std::string> fr_take_asset_rows();
 
@@ -220,6 +242,7 @@ int w_frTakeSession(lua_State *L);
 int w_frTakeErrRows(lua_State *L);          // B8 T4：捕获期 err 行（log 段组装/sim 比对）
 int w_frCaptureSuspend(lua_State *L);   // B8 T3：观察侧围栏（配对 resume）
 int w_frCaptureResume(lua_State *L);
+int w_frSessionFrame(lua_State *L);     // B10：显式补帧口（验证帧等价点）
 int w_frTakeAssets(lua_State *L);
 int w_frReplay(lua_State *L);
 int w_frNewCanvasReal(lua_State *L);
