@@ -179,7 +179,8 @@ bool fr_register_stream_asset(int kind, love::uint32 id, int w, int h, float siz
 // live 验证帧计数同口径）；末帧加三采样 PIXEL 行（live 验证帧同点同换算）。
 // 判 magic：FRB1 = 二进制（会话封装解包 + fr_dec 行解码），否则文本按行。
 // 返回 0 成功；非 0 = 错误（细节已写 stderr，含偏移 off / 行号）。
-int fr_offline_replay(const char *path, love::graphics::Graphics *gfx);
+// L 供 FR_PLAY=1 视觉播放的 present（默认判据路径不用）。
+int fr_offline_replay(lua_State *L, const char *path, love::graphics::Graphics *gfx);
 
 // 语义替代四件套（w_new* 挂钩转入，开关开时生效）：
 //   newImage(filename|ImageData) → 登记真字节 hex（文件字节 / ImageData 像素）

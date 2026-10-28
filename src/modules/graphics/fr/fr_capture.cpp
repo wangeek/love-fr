@@ -16,6 +16,7 @@
 #include "graphics/Font.h"
 #include "image/Image.h"
 #include "image/ImageData.h"
+#include "timer/Timer.h"
 #include "modules/graphics/fr/fr_codec.h"
 
 #include <algorithm>
@@ -1713,6 +1714,7 @@ struct OfflineSession
 {
 	int width = 640, height = 480;
 	std::vector<std::vector<std::string>> frames;
+	std::vector<double> dts; // B11 FR_PLAY：按录制 dt 节奏播放（默认 1/60）
 };
 
 static bool hex_valid(const std::string &s)
@@ -1830,7 +1832,12 @@ static int offline_parse_text(const std::string &buf, OfflineSession &s)
 			return 3;
 		}
 		if (ln.compare(0, 3, "dt ") == 0)
-			continue; // 离线无 kernel，dt 只跳过
+		{
+			double v = 0.0;
+			if (sscanf(ln.c_str(), "dt %lf", &v) == 1 && v > 0.0)
+				s.dts.push_back(v); // B11 FR_PLAY：录制节奏（解析序=帧序）
+			continue; // 离线无 kernel，dt 只记录
+		}
 		if (ln.compare(0, 6, "s_crc ") == 0)
 			continue; // 同上：s_crc 是内核堆快照，离线无 kernel 只跳过（B6）
 		if (ln.compare(0, 6, "d_crc ") == 0)
@@ -2172,8 +2179,13 @@ static int offline_parse_binary(const std::string &buf, OfflineSession &s)
 	return 0;
 }
 
-int fr_offline_replay(const char *path, love::graphics::Graphics *gfx)
+int fr_offline_replay(lua_State *L, const char *path, love::graphics::Graphics *gfx)
 {
+	static const bool g_fr_play = []()
+	{
+		const char *v = getenv("FR_PLAY");
+		return v != nullptr && std::string(v) == "1";
+	}();
 	if (gfx == nullptr)
 	{
 		std::fprintf(stderr, "fr-offline: graphics 模块缺席\n");
@@ -2249,6 +2261,26 @@ int fr_offline_replay(const char *path, love::graphics::Graphics *gfx)
 			love::Rect rect = {0, 0, canvas->getPixelWidth(), canvas->getPixelHeight()};
 			love::image::ImageData *img = canvas->newImageData(imagemod, 0, 0, rect);
 
+			// B11 FR_PLAY=1：视觉播放——离线画布贴屏幕（缩放适配窗口）+
+			// 按录制 dt 节奏 sleep + present。默认关（CI 判据路径零 sleep
+			// 零上屏——"持续黑窗"是拓扑 B 无头验证的既定形态，非 bug）。
+			if (g_fr_play)
+			{
+				gfx->setCanvas();
+				gfx->origin();
+				float sx = (float) gfx->getWidth() / (float) canvas->getPixelWidth();
+				float sy = (float) gfx->getHeight() / (float) canvas->getPixelHeight();
+				gfx->setColor(love::Colorf(1.0f, 1.0f, 1.0f, 1.0f));
+				love::Matrix4 m(0.0f, 0.0f, 0.0f, sx, sy, 0.0f, 0.0f, 0.0f, 0.0f);
+				gfx->draw((love::graphics::Drawable *) canvas, m);
+				love::timer::Timer *timer =
+					love::Module::getInstance<love::timer::Timer>(love::Module::M_TIMER);
+				double dt = fi < s.dts.size() ? s.dts[fi] : (1.0 / 60.0);
+				if (timer != nullptr)
+					timer->sleep(dt);
+				gfx->present(L);
+			}
+
 			// D_CRC n = 前 n 个帧块执行后的画布 CRC（live 验证帧计数同口径：
 			// live 第 3 帧回读时行缓冲恰为前 3 帧块）。
 			std::printf("D_CRC %d %u\n", (int) fi + 1,
@@ -2280,6 +2312,14 @@ int fr_offline_replay(const char *path, love::graphics::Graphics *gfx)
 	}
 	canvas->release();
 	std::fflush(stdout);
+	// FR_PLAY 播完短暂停留（末帧人眼可辨；短流播放瞬完即退的问题）。
+	if (g_fr_play)
+	{
+		love::timer::Timer *timer =
+			love::Module::getInstance<love::timer::Timer>(love::Module::M_TIMER);
+		if (timer != nullptr)
+			timer->sleep(1.0);
+	}
 	return 0;
 }
 
@@ -2343,7 +2383,7 @@ int w_frOfflineReplay(lua_State *L)
 	const char *path = luaL_checkstring(L, 1);
 	love::graphics::Graphics *gfx =
 		love::Module::getInstance<love::graphics::Graphics>(love::Module::M_GRAPHICS);
-	lua_pushinteger(L, fr_offline_replay(path, gfx));
+	lua_pushinteger(L, fr_offline_replay(L, path, gfx));
 	return 1;
 }
 
