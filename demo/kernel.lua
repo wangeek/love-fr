@@ -130,6 +130,26 @@ function kernel.draw_api(g, assets)
 	lg.rectangle("fill", 300.0, 300.0, 50.0, 50.0)   -- 行记本色（边界如实）
 	lg.setShader()                                   -- err 边界行（nil 复位）
 	lg.setColor(1, 1, 1, 1)
+
+	-- B9 代理方法族 + 去重自证（真实游戏形态：img:getDimensions/setFilter/
+	-- getFilter、font:getWidth（物化真排版）、canvas:getWidth、getType）。
+	local iw, ih = assets[1]:getDimensions()
+	lg.print(("IW=%d IH=%d %s"):format(iw, ih, assets[1]:getType()), 12.0, 380.0)
+	local cw = assets[3] and assets[3]:getWidth() or 0
+	lg.print(("CW=%d"):format(cw), 12.0, 405.0)
+	assets[1]:setFilter("nearest", "nearest")
+	local fmin = assets[1]:getFilter()
+	local tw = assets[2]:getWidth("API")            -- 物化真 Font 排版宽度
+	lg.print(("TW=%.0f %s"):format(tw, fmin), 12.0, 430.0)
+	-- 不可变资产去重：同 ImageData 两次 newImage → 同 id（canvas 不去重对照）
+	local dd = love.image.newImageData(4, 4)
+	dd:mapPixel(function() return 0, 1, 0, 1 end)
+	local ia = lg.newImage(dd)
+	local ib = lg.newImage(dd)
+	lg.print(("DUP=%s"):format(tostring(ia.id == ib.id)), 12.0, 455.0)
+	-- B9 blend 边界（battle 形态：add 后复位 alpha）
+	lg.setBlendMode("add")
+	lg.setBlendMode("alpha")
 end
 
 -- 事件处理器（B5 Task 1）：main.lua run loop 的 poll 快照逐条分发直调，

@@ -84,6 +84,17 @@ static std::map<love::uint32, love::StrongRef<love::graphics::Canvas>> &canvas_c
 	return m;
 }
 
+// B9：退出冲刷——love.cpp 在 lua_close 前调（GL 上下文/Graphics 模块仍
+// 活着）。静态缓存 StrongRef 的析构若落到 atexit 阶段（LIFO 晚于模块
+// teardown），会撞已死上下文——newgame 实测退出 SIGSEGV（atexit vector
+// release 链悬垂，探针 RVA 0x1203f2）。幂等。
+void fr_materialize_flush()
+{
+	image_cache().clear();
+	font_cache().clear();
+	canvas_cache().clear();
+}
+
 // stderr 告警按 id 一次性（行缓冲全会话累积、present 每帧重放——不收口会刷屏）。
 static void warn_once(love::uint32 id, const char *why)
 {

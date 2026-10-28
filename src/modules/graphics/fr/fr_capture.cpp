@@ -11,15 +11,90 @@
 #include "common/runtime.h"
 #include "filesystem/Filesystem.h"
 #include "graphics/Canvas.h"
+#include "graphics/Font.h"
 #include "image/Image.h"
 #include "image/ImageData.h"
 #include "modules/graphics/fr/fr_codec.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
 #include <cstring>
+
+#ifdef _WIN32
+// B9 崩溃探针（FR_CRASH_PROBE=1）：SEH 未处理异常过滤器 + dbghelp 符号
+// 解析（Release 构建带 PDB）——崩溃现场直打函数名+栈回溯，免外部调试器
+//（本机 lldb Python 桥坏/cdb 未装的三缺现场）。
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+
+namespace fr
+{
+
+static void fr_sym_line(HANDLE proc, DWORD64 addr)
+{
+	// 模块名 + 模块内 RVA（私有符号解不出时保底——llvm-symbolizer 离线解）。
+	HMODULE mod = nullptr;
+	if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+	                       | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       (LPCWSTR) (uintptr_t) addr, &mod) && mod != nullptr)
+	{
+		wchar_t wpath[MAX_PATH];
+		GetModuleFileNameW(mod, wpath, MAX_PATH);
+		char path[MAX_PATH * 2];
+		WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, sizeof path, nullptr, nullptr);
+		const char *base = strrchr(path, '\\');
+		base = base != nullptr ? base + 1 : path;
+		std::fprintf(stderr, "  %s RVA 0x%llx", base,
+		             (unsigned long long) (addr - (DWORD64) (uintptr_t) mod));
+	}
+	SYMBOL_INFO *sym = (SYMBOL_INFO *) calloc(sizeof(SYMBOL_INFO) + 256, 1);
+	if (sym != nullptr)
+	{
+		sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+		sym->MaxNameLen = 255;
+		DWORD64 disp = 0;
+		if (SymFromAddr(proc, addr, &disp, sym))
+			std::fprintf(stderr, " = %s +0x%llx\n", sym->Name, (unsigned long long) disp);
+		else
+			std::fprintf(stderr, "\n");
+		free(sym);
+	}
+}
+
+static LONG WINAPI fr_crash_filter(EXCEPTION_POINTERS *ep)
+{
+	HANDLE proc = GetCurrentProcess();
+	SymInitialize(proc, nullptr, TRUE);
+	std::fprintf(stderr, "FR_CRASH code=0x%lx addr=0x%llx\n",
+	             ep->ExceptionRecord->ExceptionCode,
+	             (unsigned long long) (uintptr_t) ep->ExceptionRecord->ExceptionAddress);
+	fr_sym_line(proc, (DWORD64) (uintptr_t) ep->ExceptionRecord->ExceptionAddress);
+	void *frames[10];
+	WORD n = CaptureStackBackTrace(0, 10, frames, nullptr);
+	std::fprintf(stderr, "FR_CRASH backtrace %u frames:\n", (unsigned) n);
+	for (WORD i = 0; i < n; i++)
+		fr_sym_line(proc, (DWORD64) (uintptr_t) frames[i]);
+	std::fflush(stderr);
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void fr_install_crash_probe()
+{
+	static bool installed = false;
+	if (!installed)
+	{
+		SetUnhandledExceptionFilter(fr_crash_filter);
+		installed = true;
+	}
+}
+
+} // namespace fr
+#endif
 
 // modules/font/Font.cpp 的默认字体：在 love::font 命名空间内 include
 // Vera.ttf.h（内嵌 TTF，仅该 TU include）——符号归属该命名空间，登记真
@@ -359,6 +434,16 @@ void capture_shader_boundary()
 	err_rows().push_back("err \"st-unsupported shader no-ir（语义边界，真执行不抑制）\"");
 }
 
+// B9：参数化语义边界（setBlendMode/printf 等——无 IR op 的渲染语义 API，
+// 捕获态零真执行纪律下的如实登记；回放侧画面承受相应语义缺口）。
+void capture_api_boundary(const char *what)
+{
+	std::string row = "err \"st-unsupported ";
+	row += what;
+	row += " no-ir（语义边界）\"";
+	err_rows().push_back(row);
+}
+
 // ------------------------------------------------------------------
 // 资产登记表 + 资产代理（语义替代四件套）
 // ------------------------------------------------------------------
@@ -371,6 +456,10 @@ struct FrAsset
 	float size = 0.0f;                // font
 	float qx = 0, qy = 0, qw = 0, qh = 0, qsw = 0, qsh = 0; // quad
 	std::string data_hex;             // image / font（空 = "-"）
+	// B9 代理态（不进协议行）：采样参数属渲染实现细节（D10），代理方法
+	// setFilter/getFilter 的承载；默认 linear/linear（11.5 新图缺省同 love
+	// 缺省 filter 族）。
+	std::string filter_min = "linear", filter_mag = "linear";
 };
 
 static std::vector<FrAsset> &assets()
@@ -423,10 +512,244 @@ struct FrProxy
 	int kind;
 };
 
+// ------------------------------------------------------------------
+// B9 代理方法族（真实游戏兼容——对象方法调用面 30+ 处：img:getWidth/
+// getDimensions、font:getWidth(text)/getHeight 等，遍布 modal/world_map/
+// battle/grotto/grid）。分派按 kind：
+//   image/canvas 几何族 = 登记几何直读（零 GPU）；
+//   font 度量族 = 物化真 Font（与回放侧同一物化器，会话缓存）调真方法
+//   ——捕获进程有窗 = 有 GL；无头录制（拓扑 C）物化失败回退 size 线性
+//   估算 + stderr 一次性告警（游戏布局计算可用，精度如实标注）。
+//   filter 族 = 代理态（D10：采样参数属渲染实现，不进协议行）。
+// ------------------------------------------------------------------
+
+static FrAsset *fr_find_asset(love::uint32 id)
+{
+	for (auto &a : assets())
+		if (a.id == id)
+			return &a;
+	return nullptr;
+}
+
+static FrProxy *proxy_arg(lua_State *L)
+{
+	return (FrProxy *) lua_touserdata(L, 1);
+}
+
+static FrAsset *proxy_asset(lua_State *L)
+{
+	FrProxy *p = proxy_arg(L);
+	return p != nullptr ? fr_find_asset(p->id) : nullptr;
+}
+
+static int pm_getWidth(lua_State *L)
+{
+	FrAsset *a = proxy_asset(L);
+	if (a != nullptr && a->kind == FR_ASSET_FONT)
+	{
+		// font:getWidth(text)——真排版宽度（物化真 Font）
+		const char *text = luaL_checkstring(L, 2);
+		love::graphics::Font *f =
+			fr_materialize_font(love::Module::getInstance<love::graphics::Graphics>(
+				love::Module::M_GRAPHICS), a->id);
+		if (f != nullptr)
+		{
+			lua_pushnumber(L, (lua_Number) f->getWidth(text));
+			return 1;
+		}
+		static bool warned = false;
+		if (!warned)
+		{
+			std::fprintf(stderr, "fr: font 度量物化失败（无头？），getWidth 回退线性估算\n");
+			warned = true;
+		}
+		lua_pushnumber(L, (lua_Number) (strlen(text) * a->size * 0.6));
+		return 1;
+	}
+	lua_pushnumber(L, a != nullptr ? (lua_Number) a->w : 0);
+	return 1;
+}
+
+static int pm_getHeight(lua_State *L)
+{
+	FrAsset *a = proxy_asset(L);
+	if (a != nullptr && a->kind == FR_ASSET_FONT)
+	{
+		love::graphics::Font *f =
+			fr_materialize_font(love::Module::getInstance<love::graphics::Graphics>(
+				love::Module::M_GRAPHICS), a->id);
+		if (f != nullptr)
+		{
+			lua_pushnumber(L, (lua_Number) f->getHeight());
+			return 1;
+		}
+		static bool warned = false;
+		if (!warned)
+		{
+			std::fprintf(stderr, "fr: font 度量物化失败（无头？），getHeight 回退 size*1.25\n");
+			warned = true;
+		}
+		lua_pushnumber(L, (lua_Number) (a->size * 1.25f));
+		return 1;
+	}
+	lua_pushnumber(L, a != nullptr ? (lua_Number) a->h : 0);
+	return 1;
+}
+
+// font 度量族其余成员（ascent/descent/baseline/lineheight 同 getHeight 形）
+enum FontMetric
+{
+	FM_LINEHEIGHT, FM_ASCENT, FM_DESCENT, FM_BASELINE
+};
+
+static int pm_font_metric(lua_State *L, FontMetric which, const char *name, float fallback)
+{
+	FrAsset *a = proxy_asset(L);
+	love::graphics::Font *f =
+		fr_materialize_font(love::Module::getInstance<love::graphics::Graphics>(
+			love::Module::M_GRAPHICS), a != nullptr ? a->id : 0);
+	lua_Number v = fallback;
+	if (f != nullptr)
+	{
+		switch (which)
+		{
+		case FM_LINEHEIGHT: v = (lua_Number) f->getLineHeight(); break;
+		case FM_ASCENT:     v = (lua_Number) f->getAscent(); break;
+		case FM_DESCENT:    v = (lua_Number) f->getDescent(); break;
+		case FM_BASELINE:   v = (lua_Number) f->getBaseline(); break;
+		}
+	}
+	else
+	{
+		static bool warned = false;
+		if (!warned)
+		{
+			std::fprintf(stderr, "fr: font 度量物化失败（无头？），%s 回退线性估算\n", name);
+			warned = true;
+		}
+	}
+	lua_pushnumber(L, v);
+	return 1;
+}
+
+static int pm_getLineHeight(lua_State *L)
+{
+	return pm_font_metric(L, FM_LINEHEIGHT, "getLineHeight",
+	                      proxy_asset(L) != nullptr ? proxy_asset(L)->size * 1.25f : 0);
+}
+
+static int pm_getAscent(lua_State *L)
+{
+	return pm_font_metric(L, FM_ASCENT, "getAscent",
+	                      proxy_asset(L) != nullptr ? proxy_asset(L)->size : 0);
+}
+
+static int pm_getDescent(lua_State *L)
+{
+	return pm_font_metric(L, FM_DESCENT, "getDescent",
+	                      proxy_asset(L) != nullptr ? proxy_asset(L)->size * 0.25f : 0);
+}
+
+static int pm_getBaseline(lua_State *L)
+{
+	return pm_font_metric(L, FM_BASELINE, "getBaseline",
+	                      proxy_asset(L) != nullptr ? proxy_asset(L)->size : 0);
+}
+
+static int pm_getDimensions(lua_State *L)
+{
+	FrAsset *a = proxy_asset(L);
+	lua_pushnumber(L, a != nullptr ? (lua_Number) a->w : 0);
+	lua_pushnumber(L, a != nullptr ? (lua_Number) a->h : 0);
+	return 2;
+}
+
+static int pm_getPixelWidth(lua_State *L)
+{
+	FrProxy *p = proxy_arg(L);
+	FrAsset *a = fr_find_asset(p != nullptr ? p->id : 0);
+	lua_pushnumber(L, a != nullptr ? (lua_Number) a->w : 0); // dpiScale=1 口径
+	return 1;
+}
+
+static int pm_getPixelHeight(lua_State *L)
+{
+	FrProxy *p = proxy_arg(L);
+	FrAsset *a = fr_find_asset(p != nullptr ? p->id : 0);
+	lua_pushnumber(L, a != nullptr ? (lua_Number) a->h : 0);
+	return 1;
+}
+
+static int pm_setFilter(lua_State *L)
+{
+	FrAsset *a = proxy_asset(L);
+	const char *mn = luaL_checkstring(L, 2);
+	const char *mg = luaL_checkstring(L, 3);
+	if (a != nullptr)
+	{
+		a->filter_min = mn;
+		a->filter_mag = mg;
+	}
+	return 0;
+}
+
+static int pm_getFilter(lua_State *L)
+{
+	FrAsset *a = proxy_asset(L);
+	lua_pushstring(L, a != nullptr ? a->filter_min.c_str() : "linear");
+	lua_pushstring(L, a != nullptr ? a->filter_mag.c_str() : "linear");
+	return 2;
+}
+
+static int pm_getType(lua_State *L)
+{
+	FrProxy *p = proxy_arg(L);
+	const char *t = "unknown";
+	if (p != nullptr)
+	{
+		switch (p->kind)
+		{
+		case FR_ASSET_IMAGE: t = "Image"; break;
+		case FR_ASSET_CANVAS: t = "Canvas"; break;
+		case FR_ASSET_QUAD: t = "Quad"; break;
+		case FR_ASSET_FONT: t = "Font"; break;
+		}
+	}
+	lua_pushstring(L, t);
+	return 1;
+}
+
+// 方法表（__index 首查）：同名方法按 kind 分派（getWidth 在 image=几何、
+// font=排版宽度——pm_getWidth 内分派）。
+static const struct { const char *name; lua_CFunction fn; } k_proxy_methods[] =
+{
+	{"getWidth", pm_getWidth},
+	{"getHeight", pm_getHeight},
+	{"getDimensions", pm_getDimensions},
+	{"getPixelWidth", pm_getPixelWidth},
+	{"getPixelHeight", pm_getPixelHeight},
+	{"setFilter", pm_setFilter},
+	{"getFilter", pm_getFilter},
+	{"getType", pm_getType},
+	{"getLineHeight", pm_getLineHeight},
+	{"getAscent", pm_getAscent},
+	{"getDescent", pm_getDescent},
+	{"getBaseline", pm_getBaseline},
+	{nullptr, nullptr}
+};
+
 static int proxy_index(lua_State *L)
 {
 	FrProxy *p = (FrProxy *) lua_touserdata(L, 1);
 	const char *k = luaL_checkstring(L, 2);
+	for (auto *m = k_proxy_methods; m->name != nullptr; m++)
+	{
+		if (strcmp(k, m->name) == 0)
+		{
+			lua_pushcfunction(L, m->fn);
+			return 1;
+		}
+	}
 	if (strcmp(k, "id") == 0)
 	{
 		lua_pushinteger(L, (lua_Integer) p->id);
@@ -437,7 +760,18 @@ static int proxy_index(lua_State *L)
 		lua_pushinteger(L, p->kind);
 		return 1;
 	}
-	return luaL_error(L, "fr.asset proxy: 未知字段 \"%s\"（可用 id/kind）", k);
+	// B9 探针：游戏访问未支持的字段/方法——兼容缺口现场可见（stderr 每
+	// 键一次），配合冒烟迭代收窄代理面。
+	static std::vector<std::string> seen;
+	std::string key(k);
+	if (std::find(seen.begin(), seen.end(), key) == seen.end())
+	{
+		seen.push_back(key);
+		std::fprintf(stderr, "fr: 代理字段未支持: %s（id=%u kind=%d）\n",
+		             k, (unsigned) (p != nullptr ? p->id : 0),
+		             p != nullptr ? p->kind : -1);
+	}
+	return luaL_error(L, "fr.asset proxy: 未知字段 \"%s\"（方法族/可用 id/kind）", k);
 }
 
 static int proxy_tostring(lua_State *L)
@@ -491,8 +825,42 @@ love::uint32 fr_current_font() { return s_current_font; }
 
 static love::uint32 register_asset(const FrAsset &a)
 {
+	// B9 资源爆炸对策①——不可变资产去重：image/font/quad 内容由参数全决
+	//（字节/几何），同参重建 = 同一资产（游戏侧多 cache 重复创建的兜底，
+	// 典型：font.lua 多处 M.get(size) 各自建、tileset 多处 newImage 同路径）
+	//——复用既有 id，不重复产行。**canvas 永不去重**：可变渲染目标，同尺寸
+	// 内容独立（world_map fog/minimap 两块同参 canvas 是两个资产）。
+	if (a.kind != FR_ASSET_CANVAS)
+	{
+		for (const auto &e : assets())
+		{
+			if (e.kind != a.kind || e.w != a.w || e.h != a.h)
+				continue;
+			if (e.kind == FR_ASSET_FONT && e.size != a.size)
+				continue;
+			if (e.kind == FR_ASSET_QUAD
+			    && (e.qx != a.qx || e.qy != a.qy || e.qw != a.qw || e.qh != a.qh
+			        || e.qsw != a.qsw || e.qsh != a.qsh))
+				continue;
+			if (e.data_hex != a.data_hex)
+				continue;
+			return e.id;
+		}
+	}
 	assets().push_back(a);
 	asset_rows().push_back(render_asset_row(a));
+	// B9 资源爆炸对策②——观测护栏（不设限，一次性告警）：真实游戏资产面
+	// 超出 demo 量级时现场可见（流体积 = 登记字节总量主导）。
+	static love::uint64 total_bytes = 0;
+	static bool warned = false;
+	total_bytes += a.data_hex.size() / 2;
+	if (!warned && (assets().size() > 256 || total_bytes > 16ull * 1024 * 1024))
+	{
+		std::fprintf(stderr, "fr: 资产量级告警——登记 %zu 项 / %llu 字节"
+			"（会话体积主导项，检查去重/生命周期）\n",
+			assets().size(), (unsigned long long) total_bytes);
+		warned = true;
+	}
 	return a.id;
 }
 
@@ -574,25 +942,57 @@ int w_frNewImage(lua_State *L)
 	}
 
 	a.id = next_asset_id();
-	register_asset(a);
+	a.id = register_asset(a); // B9 去重可复用既有 id（不可变资产）
 	push_proxy(L, a);
 	return 1;
 }
 
 int w_frNewFont(lua_State *L)
 {
-	// demo 边界：仅 newFont(size) 形态。默认字体 = Font.cpp 内嵌 Vera.ttf
-	//（DefaultFontData）——登记其真字节 + size（B4 阶段三；物化侧
-	// newTrueTypeRasterizer 同链重建）。文件/Rasterizer 形态归后续批次。
-	if (lua_type(L, 1) != LUA_TNUMBER)
-		return luaL_error(L, "fr.newFont: 语义替代仅支持 newFont(size) 形态（B4 demo 边界）");
-
+	// B9 形态扩面（真实游戏 font.lua 主路径）：
+	//   newFont(size)              → 内嵌 Vera（demo 基线，原语义）
+	//   newFont(path [, size])     → 文件真字节登记（中文 TTF 数 MB，去重兜底）
+	//   newFont(FileData [, size]) → 同上（系统字体 io.open 读字节形态）
+	//   Rasterizer 形态            → 边界（Lua error——如实阻断，无字节可登记）
+	// size 缺省 12（love 同缺省）。
 	FrAsset a;
 	a.kind = FR_ASSET_FONT;
-	a.size = (float) luaL_checknumber(L, 1);
-	a.data_hex = hex_encode(love::font::Vera_ttf, love::font::Vera_ttf_len);
+	int t = lua_type(L, 1);
+
+	if (t == LUA_TNUMBER)
+	{
+		a.size = (float) luaL_checknumber(L, 1);
+		a.data_hex = hex_encode(love::font::Vera_ttf, love::font::Vera_ttf_len);
+	}
+	else if (t == LUA_TSTRING || luax_istype(L, 1, love::filesystem::FileData::type))
+	{
+		const love::filesystem::FileData *bytes = nullptr;
+		love::filesystem::FileData *owned = nullptr;
+		if (t == LUA_TSTRING)
+		{
+			const char *path = luaL_checkstring(L, 1);
+			love::filesystem::Filesystem *fs =
+				love::Module::getInstance<love::filesystem::Filesystem>(love::Module::M_FILESYSTEM);
+			if (fs == nullptr)
+				return luaL_error(L, "fr.newFont: filesystem 未初始化");
+			love::luax_catchexcept(L, [&]() { owned = fs->read(path); });
+			bytes = owned;
+		}
+		else
+			bytes = love::luax_checktype<love::filesystem::FileData>(L, 1); // 栈持有
+		a.size = (float) luaL_optnumber(L, 2, 12.0);
+		a.data_hex = hex_encode(bytes->getData(), bytes->getSize());
+		if (owned != nullptr)
+			owned->release();
+	}
+	else
+	{
+		return luaL_error(L, "fr.newFont: Rasterizer 形态未支持（语义边界——无字节可登记）");
+	}
+
 	a.id = next_asset_id();
-	register_asset(a);
+	love::uint32 id = register_asset(a); // 去重可复用既有 id
+	a.id = id;
 	push_proxy(L, a);
 	return 1;
 }
@@ -605,7 +1005,7 @@ int w_frNewCanvas(lua_State *L)
 	a.h = (int) luaL_checkinteger(L, 2);
 	// 不建真 Canvas（文件头 Canvas 边界：回读 rig 走 _frNewCanvasReal）。
 	a.id = next_asset_id();
-	register_asset(a);
+	a.id = register_asset(a); // canvas 不去重（可变目标），统一同口
 	push_proxy(L, a);
 	return 1;
 }
@@ -621,7 +1021,7 @@ int w_frNewQuad(lua_State *L)
 	a.qsw = (float) luaL_checknumber(L, 5);
 	a.qsh = (float) luaL_checknumber(L, 6);
 	a.id = next_asset_id();
-	register_asset(a);
+	a.id = register_asset(a); // B9 去重可复用既有 id（纯几何资产）
 	push_proxy(L, a);
 	return 1;
 }
@@ -701,9 +1101,22 @@ void capture_exec_row(love::graphics::Graphics *gfx, const std::string &row)
 		if (sscanf(row.c_str(), "draw %u %u %f %f %f %f %f %f %f %d %d %d %d",
 		           &tex, &quad, &x, &y, &rot, &sx, &sy, &ox, &oy, &r, &g, &b, &a) == 13)
 		{
-			love::graphics::Image *img =
-				(quad == 0) ? fr_materialize_image(gfx, tex) : nullptr;
-			if (img != nullptr)
+			// B9 canvas 合成：draw 引用 canvas 资产（fog/minimap 贴回屏幕）
+			//——物化为回放目标 Canvas（与 rt 行同一缓存：rt 段画进去、这里
+			// 贴出来 = cmd.tbl rt 行注记"canvas 间合成=draw 引用"的兑现）。
+			love::graphics::Image *img = nullptr;
+			love::graphics::Canvas *cv = nullptr;
+			if (quad == 0)
+			{
+				if (fr_asset_kind_of(tex) == FR_ASSET_CANVAS)
+					cv = fr_materialize_canvas(gfx, tex);
+				else
+					img = fr_materialize_image(gfx, tex);
+			}
+			love::graphics::Drawable *drawable =
+				img != nullptr ? (love::graphics::Drawable *) img
+				: cv != nullptr ? (love::graphics::Drawable *) cv : nullptr;
+			if (drawable != nullptr)
 			{
 				// 裸参数矩阵重建（luax_checkstandardtransform 的
 				// Matrix4(x,y,a,sx,sy,ox,oy,kx,ky) 同构；x/y 已是捕获时
@@ -711,7 +1124,7 @@ void capture_exec_row(love::graphics::Graphics *gfx, const std::string &row)
 				love::Matrix4 m(x, y, rot, sx, sy, ox, oy, 0.0f, 0.0f);
 				gfx->setColor(love::Colorf(r / 255.0f, g / 255.0f,
 				                           b / 255.0f, a / 255.0f));
-				gfx->draw((love::graphics::Drawable *) img, m);
+				gfx->draw(drawable, m);
 			}
 			else
 			{
@@ -999,6 +1412,34 @@ void capture_replay(love::graphics::Graphics *gfx)
 		capture_exec_row(gfx, row);
 	// 收尾回基线：rt 3 中途留在物化 Canvas 的帧也归位（基线=屏幕时与
 	// setCanvas() 同义；present 钩路径天然如此）。
+	if (g_replay_baseline_canvas)
+		gfx->setCanvas(saved);
+	else
+		gfx->setCanvas();
+	g_replay_baseline_canvas = false;
+}
+
+// B9：present 上屏增量重放——游标记已重放行，每帧只执行新增（行缓冲仍
+// 全会话累积，tee₁ 不受影响）。语义等价：真执行同样不清历史帧，本帧行
+// 含 clear 时自然覆盖。**性能**：全量重放成本 O(会话行数)/帧——demo 25
+// 行/帧无感，真实游戏 2500+ tile draw 行/帧 → 二次方爆炸（newgame 实测
+// 每帧 11s+）。验证 Canvas（_frReplay，空白画布）仍走全量 capture_replay。
+void capture_replay_delta(love::graphics::Graphics *gfx)
+{
+	static size_t replayed = 0;
+	if (gfx == nullptr)
+		return;
+
+	std::vector<std::string> &rs = rows();
+	if (rs.size() <= replayed)
+		return; // 本帧无新增行（如纯事件帧）
+
+	love::graphics::Graphics::RenderTargets saved = gfx->getCanvas();
+	g_replay_baseline = saved;
+	g_replay_baseline_canvas = !saved.colors.empty();
+	for (size_t i = replayed; i < rs.size(); i++)
+		capture_exec_row(gfx, rs[i]);
+	replayed = rs.size();
 	if (g_replay_baseline_canvas)
 		gfx->setCanvas(saved);
 	else

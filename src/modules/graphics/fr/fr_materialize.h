@@ -52,4 +52,8 @@ love::graphics::Font *fr_materialize_font(love::graphics::Graphics *gfx, love::u
 // 登记资产 id → 真 Canvas（B8 T3：rt 行回放目标；缓存所有）。
 love::graphics::Canvas *fr_materialize_canvas(love::graphics::Graphics *gfx, love::uint32 id);
 
+// B9：退出冲刷（love.cpp lua_close 前调——静态 StrongRef 析构落到 atexit
+// 会撞已死 GL/模块上下文；幂等）。LOVE_EXPORT：跨 DLL（launcher → liblove）。
+LOVE_EXPORT void fr_materialize_flush();
+
 } // fr

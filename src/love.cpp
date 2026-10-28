@@ -45,6 +45,10 @@ extern "C" {
 #include "common/ios.h"
 #endif
 
+// FR fork (B9): defined in liblove (fr/fr_materialize.cpp). File-scope
+// declaration – the launcher target has no graphics include paths.
+namespace fr { void fr_materialize_flush(); }
+
 #ifdef LOVE_WINDOWS
 extern "C"
 {
@@ -246,6 +250,12 @@ static DoneAction runlove(int argc, char **argv, int &retval)
 		done = DONE_RESTART;
 	if (lua_isnumber(L, -1))
 		retval = (int) lua_tonumber(L, -1);
+
+	// FR fork (B9): flush materializer caches while GL/Graphics are still
+	// alive. Static StrongRef destructors reaching atexit (after module
+	// teardown) hit dead contexts (observed SEGV on third-party exit).
+	// Idempotent; harmless with capture off.
+	fr::fr_materialize_flush();
 
 	lua_close(L);
 

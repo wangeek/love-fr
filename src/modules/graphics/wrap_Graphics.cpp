@@ -196,7 +196,11 @@ int w_present(lua_State *L)
 	// 无头/有窗逐字节一致锚；遍历纯字节读无 GL 依赖，红线见 fr_statediff.h）。
 	// B6 Task 2（diff 档）：同一 present 点影子镜像 diff → st 物理行入当帧
 	// 缓存（FR_LOGLEVEL≠full 时函数内自 no-op——档位隔离）。
-	if (fr::capture_enabled())
+	// B9 崩溃探针懒装（FR_CRASH_PROBE=1）：SEH 过滤器 + PDB 符号（现场直读）。
+	if (fr::capture_enabled() && getenv("FR_CRASH_PROBE") != nullptr)
+		fr::fr_install_crash_probe();
+	// B9 FR_NO_SCRC=1：跳过堆 CRC/diff（崩溃归属二分探针②）。
+	if (fr::capture_enabled() && getenv("FR_NO_SCRC") == nullptr)
 	{
 		fr::capture_state_crc(L);
 		fr::capture_state_diff(L);
@@ -207,8 +211,10 @@ int w_present(lua_State *L)
 	// 无窗（拓扑 C 无头，FR_HEADLESS=1）时 isCreated()=false——回放需要渲染
 	// 目标（GL 上下文），跳过；行缓冲不受影响（tee/离线消费照常）。真 present
 	// 本体 isActive() 无窗早退（Graphics.cpp:354），安全直调。
-	if (fr::capture_enabled() && instance()->isCreated())
-		fr::capture_replay(instance());
+	// B9 FR_NO_REPLAY=1：跳过回放（崩溃归属二分探针——捕获侧/回放侧定位）。
+	if (fr::capture_enabled() && instance()->isCreated()
+	    && getenv("FR_NO_REPLAY") == nullptr)
+		fr::capture_replay_delta(instance()); // B9：增量——全量随会话行数二次方
 
 	luax_catchexcept(L, [&]() { instance()->present(L); });
 	return 0;
@@ -1914,6 +1920,14 @@ int w_getColorMask(lua_State *L)
 
 int w_setBlendMode(lua_State *L)
 {
+	// B9 捕获钩：blend 无 IR op——err 边界登记 + 零真执行（D12-2 纪律；
+	// 回放画面承受 blend 语义缺口，如实登记。op 化待取证立项）。
+	if (fr::capture_enabled())
+	{
+		fr::capture_api_boundary("blendmode");
+		return 0;
+	}
+
 	Graphics::BlendMode mode;
 	const char *str = luaL_checkstring(L, 1);
 	if (!Graphics::getConstant(str, mode))
@@ -2644,6 +2658,14 @@ int w_print(lua_State *L)
 
 int w_printf(lua_State *L)
 {
+	// B9 捕获钩：printf（对齐排版）无行位——err 边界 + 零真执行
+	//（newgame 未用；语义面如实登记，对齐 op 化待取证）。
+	if (fr::capture_enabled())
+	{
+		fr::capture_api_boundary("printf-align");
+		return 0;
+	}
+
 	std::vector<Font::ColoredString> str;
 	luax_checkcoloredstring(L, 1, str);
 

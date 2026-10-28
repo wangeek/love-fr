@@ -107,6 +107,10 @@ void capture_rect(love::uint8 mode, float x, float y, float w, float h, float rx
 // 方法，绕过 Lua 边界）。不消费缓冲。缓冲空 = no-op（开关关时安全可调）。
 void capture_replay(love::graphics::Graphics *gfx);
 
+// B9：present 上屏增量重放（游标式；性能——全量成本随会话行数二次方，
+// 真实游戏 2500+ 行/帧实测爆炸）。验证 Canvas 场景仍走全量版。
+void capture_replay_delta(love::graphics::Graphics *gfx);
+
 // 单行执行（capture_replay 的 per-row 内核）：拓扑 B 离线回放与 tee₂ 回放
 // 共用同一行执行入口（物化器/真渲染同构的关键，B4 阶段三 Task 3）。
 // B8 T3：rt 0 的"屏幕" = 回放会话基线目标（两回放驱动进出配对设置）。
@@ -116,6 +120,9 @@ void capture_exec_row(love::graphics::Graphics *gfx, const std::string &row);
 // 旁路=真执行零记录）。验证帧 rig 的真 Canvas 切换是观察机器，不进内核流。
 void capture_suspend();
 void capture_resume();
+
+// B9：SEH 崩溃探针（仅 Windows；FR_CRASH_PROBE=1 时由 present 钩懒装）。
+void fr_install_crash_probe();
 
 // out 段行文本（draw/print/rect/clear）。
 std::vector<std::string> capture_take_rows();
@@ -190,6 +197,7 @@ void capture_rt(love::uint32 target);          // setCanvas → rt 行（0=屏�
 void capture_scissor(float x, float y, float w, float h); // -1 哨兵=off
 void capture_shader_boundary();                 // setShader → err 行（语义边界）
 int fr_asset_kind_of(love::uint32 id);          // 资产号 → kind（0=未登记）
+void capture_api_boundary(const char *what);    // B9：参数化 err 边界（blendmode/printf…）
 
 // Lua 出口：
 //   love.graphics._frTakeSession() → out 段行文本数组；

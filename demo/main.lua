@@ -292,6 +292,13 @@ local function register_assets()
 	FR_ASSETS[1] = love.graphics.newImage(img_data)
 	FR_ASSETS[2] = love.graphics.newFont(14)
 	FR_ASSETS[3] = love.graphics.newCanvas(256, 256)  -- B8 T3：canvas 代理（rt 行验收）
+	-- B9：newFont(FileData) 形态（伪字节自证登记面）。**仅捕获态**——真
+	-- newFont 走 FreeType，伪字节 FT_New_Face 必炸（无捕获模式蓝屏实测）；
+	-- sim 重演同为捕获态，录制/重演一致。
+	if os.getenv("FR_CAPTURE") == "1" then
+		local fd = love.filesystem.newFileData(("\0\1\2\3"):rep(8), "fake.ttf")
+		FR_ASSETS[4] = love.graphics.newFont(fd, 12)
+	end
 end
 
 function ir_graphics.draw(tex, quad, x, y, rot, sx, sy, ox, oy, r, g, b, a)
