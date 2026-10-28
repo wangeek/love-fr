@@ -70,6 +70,68 @@ function kernel.draw(g, assets)
 	end
 end
 
+-- B8 T4 全 API 闭环（--api-parade 通道）：直调 love.graphics.* 全清单——
+-- 验收靶 = newgame 实测调用面 20 API（docs/plans/2026-10-28-b8-semantics.md）。
+-- 三类语义全覆盖：状态折参（setColor/setLineWidth/setFont）、状态行
+--（setCanvas/setScissor）、边界登记（setShader err）；查询与变换栈零记录
+-- 天然正确（getWidth/getHeight 透传；origin/push/pop/translate/scale 在
+-- 绘制挂钩时刻结算进世界坐标——下方 rect/line 断言即结算自证）。独立通道
+-- 不进 kernel.draw：主 demo 是逐行回归基线，计数不可漂。
+-- 变换段预期锚（translate(10,10)*scale(1.5)）：rect(20,20)→(40,40)；
+-- line(10,80)→(25,130)；circle(60,120)→(100,190)；poly/points/arc 同构
+--（w/h/radius 直通不缩放——L0 shim 同口径，fr_capture.h）。
+function kernel.draw_api(g, assets)
+	local lg = love.graphics
+	lg.setBackgroundColor(0.1, 0.1, 0.2, 1)          -- 环境层：真执行零记录
+	local w, h = lg.getWidth(), lg.getHeight()       -- 查询：透传真值
+	lg.clear(0, 0, 0, 255)                           -- clear 行
+	lg.origin()                                      -- 变换栈复位（零记录）
+	lg.push()
+	lg.translate(10.0, 10.0)
+	lg.scale(1.5, 1.5)
+	lg.setColor(1, 0, 0, 1)
+	lg.setLineWidth(3)                               -- 折进 line/rect 行 width
+	lg.rectangle("fill", 20.0, 20.0, 40.0, 30.0)     -- 结算 → (40,40)
+	lg.line(10.0, 80.0, 90.0, 80.0)                  -- 结算 → (25,130)-(145,130)
+	lg.setColor(0, 1, 0, 1)
+	lg.circle("fill", 60.0, 120.0, 20.0, 12)         -- 结算 → (100,190)
+	lg.polygon("fill", 40.0, 150.0, 60.0, 150.0, 50.0, 170.0)
+	lg.setColor(0, 0, 1, 1)
+	lg.arc("fill", "pie", 100.0, 200.0, 25.0, 0.0, 1.570796, 10)
+	lg.points(130.0, 200.0, 140.0, 210.0)
+	lg.pop()                                         -- 回 identity
+	lg.origin()
+	lg.setColor(1, 1, 1, 1)
+	lg.draw(assets[1], 200.0, 40.0)                  -- draw 行（资产 1）
+	lg.setFont(assets[2])                            -- 字体状态
+	lg.print("API", 12.0, 300.0)                     -- print 行
+	lg.print(("W=%d H=%d"):format(w, h), 12.0, 340.0) -- 查询值进文本（透传自证）
+	lg.setScissor(50, 50, 200, 100)                  -- scissor 行
+	lg.setColor(1, 0, 1, 1)
+	lg.rectangle("fill", 60.0, 60.0, 80.0, 60.0)
+	lg.setScissor()                                  -- off 哨兵
+	if assets[3] then
+		lg.setCanvas(assets[3])                      -- rt 3
+		lg.clear(0, 0, 1, 1)                         -- 蓝（画进 canvas）
+		lg.setColor(0, 1, 1, 1)
+		lg.rectangle("fill", 8.0, 8.0, 48.0, 48.0)
+		lg.setCanvas()                               -- rt 0
+	end
+	lg.setColor(1, 1, 1, 1)
+	-- Shader 边界：newShader 真对象构造（无钩）→ setShader err 行 ×2（设/复位）
+	local sh = lg.newShader([[
+		vec4 effect(vec4 color, Image tex, vec2 uv, vec2 pc)
+		{
+			return vec4(1.0, 0.5, 0.0, 1.0);
+		}
+	]])
+	lg.setShader(sh)                                 -- err 边界行
+	lg.setColor(1, 1, 0, 1)
+	lg.rectangle("fill", 300.0, 300.0, 50.0, 50.0)   -- 行记本色（边界如实）
+	lg.setShader()                                   -- err 边界行（nil 复位）
+	lg.setColor(1, 1, 1, 1)
+end
+
 -- 事件处理器（B5 Task 1）：main.lua run loop 的 poll 快照逐条分发直调，
 -- 签名 = love 同名回调的参数前缀（kernel 只取关心的前缀参，尾参可略）。
 kernel.handlers = {

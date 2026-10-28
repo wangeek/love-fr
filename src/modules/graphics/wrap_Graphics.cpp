@@ -3306,6 +3306,7 @@ static const luaL_Reg functions[] =
 
 	// B4-2 FR 捕获层出口（fork 魔改，fr_capture.h）。
 	{ "_frTakeSession", fr::w_frTakeSession },
+	{ "_frTakeErrRows", fr::w_frTakeErrRows },   // B8 T4：捕获期 err 行（log 段语义）
 	{ "_frCaptureSuspend", fr::w_frCaptureSuspend }, // B8 T3：观察侧围栏（rig 机器行不进内核流）
 	{ "_frCaptureResume", fr::w_frCaptureResume },
 	{ "_frTakeAssets", fr::w_frTakeAssets },

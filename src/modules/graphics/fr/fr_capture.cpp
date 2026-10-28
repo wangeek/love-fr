@@ -57,6 +57,15 @@ static std::vector<std::string> &asset_rows()
 //（多 VM 原则：观察机器不进被观测流）。
 static int g_suspend = 0;
 
+// B8 T4：捕获期 err 行（Shader 边界等）独立缓冲——err 属 log 段（B6 行序
+// dt→asset→ev→st/err→out；err 豁免于 off/base 档），不混 out 捕获流
+//（d_crc 口径 = 纯 out op，statediff 的 err 行同此纪律）。
+static std::vector<std::string> &err_rows()
+{
+	static std::vector<std::string> r;
+	return r;
+}
+
 bool capture_enabled()
 {
 	static const bool enabled = []()
@@ -346,7 +355,8 @@ void capture_scissor(float x, float y, float w, float h)
 
 void capture_shader_boundary()
 {
-	rows().push_back("err \"st-unsupported shader no-ir（语义边界，真执行不抑制）\"");
+	// err 行进独立缓冲（log 段语义）——不出现在 out 捕获流（take_delta/d_crc）。
+	err_rows().push_back("err \"st-unsupported shader no-ir（语义边界，真执行不抑制）\"");
 }
 
 // ------------------------------------------------------------------
@@ -1005,6 +1015,13 @@ std::vector<std::string> capture_take_rows()
 	return rows();
 }
 
+// B8 T4：捕获期 err 行（累积拷贝；demo 侧切 per-frame delta——与 out 行
+// take_delta 同构，帧界由 Lua 按已取行数切）。
+std::vector<std::string> fr_take_err_rows()
+{
+	return err_rows();
+}
+
 std::vector<std::string> fr_take_asset_rows()
 {
 	return asset_rows();
@@ -1024,6 +1041,11 @@ static int push_string_array(lua_State *L, const std::vector<std::string> &rs)
 int w_frTakeSession(lua_State *L)
 {
 	return push_string_array(L, rows());
+}
+
+int w_frTakeErrRows(lua_State *L)
+{
+	return push_string_array(L, err_rows());
 }
 
 // B8 T3：观察侧围栏出口（demo 验证帧 rig 机器行不进内核流；配对调用，

@@ -98,6 +98,19 @@ local function get_val(flag)
 	return nil
 end
 
+-- 无值开关（--api-parade 等）：存在即真。
+local function has_flag(flag)
+	for _, a in ipairs(args) do
+		if a == flag then return true end
+	end
+	return false
+end
+
+-- B8 T4 全 API 闭环通道：kernel.draw_api 直调 20 API 靶（验收线=不崩溃+
+-- 会话完整+sim MATCH）。独立于 kernel.draw——主 demo 逐行基线不可漂。
+--（draw_kernel 定义在 ir_graphics/FR_ASSETS 之后——上值可见性。）
+local API_PARADE = has_flag("--api-parade")
+
 -- 拓扑 B 离线回放（B4 阶段三 Task 3）：--offline-replay <path> 独占模式——
 -- 不跑 kernel/run loop（也不吃 --out/--sha），main.lua 载入时 graphics 模块
 -- 已创建（boot.lua love.init 先 require("main")），直接调 C 入口：读流 →
@@ -174,6 +187,8 @@ INJECT_KEY = get_val("--inject-key")
 -- Canvas 捕获也归该帧）。
 local taken = 0
 local frame_rows = {}                        -- frame_rows[f] = 第 f 帧的 out 行
+local err_taken = 0
+local frame_err_rows = {}                    -- frame_err_rows[f] = 第 f 帧捕获期 err 行（B8 T4，log 段）
 local frame_in_rows = {}                     -- frame_in_rows[f] = 第 f 帧的 ev 行（B5 Task 1）
 local frame_dcrcs = {}                       -- frame_dcrcs[f] = 第 f 帧的 d_crc（B7a）
 
@@ -184,6 +199,18 @@ local function take_delta()
 		delta[#delta + 1] = all[i]
 	end
 	taken = #all
+	return delta
+end
+
+-- B8 T4：捕获期 err 行 delta（Shader 边界等，log 段语义——与 out 行
+-- take_delta 同构；err 豁免于 off/base 档，任何档都收集）。
+local function take_err_delta()
+	local all = love.graphics._frTakeErrRows()
+	local delta = {}
+	for i = err_taken + 1, #all do
+		delta[#delta + 1] = all[i]
+	end
+	err_taken = #all
 	return delta
 end
 
@@ -292,8 +319,18 @@ function love.update(dt)
 	kernel.update(FIXED_DT)
 end
 
+-- B8 T4：draw 分派（api-parade 通道/主 demo 通道）——run loop、验证帧、
+-- sim 循环三处同走本口（录制/重演同一代码路径）。
+local function draw_kernel()
+	if API_PARADE then
+		kernel.draw_api(ir_graphics, FR_ASSETS)
+	else
+		kernel.draw(ir_graphics, FR_ASSETS)
+	end
+end
+
 function love.draw()
-	kernel.draw(ir_graphics, FR_ASSETS)
+	draw_kernel()
 end
 
 local VERIFY_FRAME = 3
@@ -356,8 +393,13 @@ local function write_session()
 		if ins then
 			for _, row in ipairs(ins) do parts[#parts + 1] = row end
 		end
-		-- B6 Task 2：log 段 st 物理行 + err 行（diff 档；收集点 = present 钩/
-		-- 验证帧显式，与 s_crc 同帧纪律——每帧恰一份）
+		-- B6 Task 2：log 段 st 物理行 + err 行。行序 = 捕获期 err（draw 序，
+		-- B8 T4：Shader 边界等，任何档）→ present 期 statediff 行（full 档，
+		-- 收集点 = present 钩/验证帧显式，与 s_crc 同帧纪律——每帧恰一份）
+		local errs = frame_err_rows[f]
+		if errs then
+			for _, row in ipairs(errs) do parts[#parts + 1] = row end
+		end
 		if sdiffs then
 			assert(sdiffs[f] ~= nil, "fr-demo: 帧 " .. tostring(f) .. " 缺 diff 行（收集钩缺席？）")
 			for _, row in ipairs(sdiffs[f]) do parts[#parts + 1] = row end
@@ -463,6 +505,7 @@ local function frame_body()
 
 	if TEE then
 		frame_rows[frame] = take_delta()
+		frame_err_rows[frame] = take_err_delta() -- B8 T4：log 段 err 行（任何档）
 		-- B7a d_crc：当帧 out 行（take_delta 同批）文本 join "\n" 的 CRC32
 		--（cmd.tbl d_crc：out 记录 CRC32）。行集口径 = out 段 op
 		--（clear/draw/print/rect，不含 dt/asset/ev/st/err/s_crc）；demo 拼串、
@@ -687,19 +730,24 @@ if SIM_PATH then
 					if h then h(unpack(ev, 2)) end
 				end
 			end
-			-- ③ update 吃录制 dt → draw 捕获再生行
+			-- ③ update 吃录制 dt → draw 捕获再生行（api-parade 流走 draw_api 同通道）
 			kernel.update(fr.dt)
-			kernel.draw(ir_graphics, FR_ASSETS)
+			draw_kernel()
 			-- B6 状态 CRC（Task 1b 子图口径）：present 等价点收集，与录制侧
 			-- 同一出口（_frStateSubCRC，根已载入期登记）——子图只含
 			-- kernel.state，本进程 parse/簿记表不进 CRC，跨进程等值可达；
 			-- collectgarbage 沿用录制侧既定口径。
 			collectgarbage("collect")
 			local scrc = love.graphics._frStateSubCRC()
-			-- B6 Task 2：diff 档同点收集（FR_LOGLEVEL=full 时非空）——st/err
-			-- 行纳入 SIM 比对集（状态演化重演一致的强判据）；档位不对称
-			--（流有 log 行而本侧 base 或反之）→ 空集对非空集，如实 MISMATCH。
-			local genlog = LOGLVL_FULL and love.graphics._frStateDiffRows() or {}
+			-- B6 Task 2 + B8 T4：log 行比对集 = 捕获期 err（draw 序，任何档）
+			-- + diff 档 statediff 行（FR_LOGLEVEL=full 时非空）——与录制侧
+			-- write_session 的 log 段行序同构（err → st/err）；档位不对称
+			--（流有 statediff 行而本侧 base 或反之）→ 如实 MISMATCH。
+			local genlog = take_err_delta()
+			if LOGLVL_FULL then
+				local sd = love.graphics._frStateDiffRows()
+				for _, r in ipairs(sd) do genlog[#genlog + 1] = r end
+			end
 			local gen = take_delta()
 			-- B7a：重演侧同收集 d_crc——当帧再生 out 行（take_delta 同批）
 			-- 文本 join "\n" 的 CRC32，与录制侧同口径（demo 拼串、C 侧

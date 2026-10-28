@@ -119,6 +119,8 @@ void capture_resume();
 
 // out 段行文本（draw/print/rect/clear）。
 std::vector<std::string> capture_take_rows();
+// 捕获期 err 行（Shader 边界等，log 段语义；累积拷贝，demo 切 delta）。
+std::vector<std::string> fr_take_err_rows();
 // 资产行文本（登记序，Task 4 会话组装按 frame 0 checkpoint 注入）。
 std::vector<std::string> fr_take_asset_rows();
 
@@ -207,6 +209,7 @@ int fr_asset_kind_of(love::uint32 id);          // 资产号 → kind（0=未登
 //       表，污染末帧 s_crc 的窗口/无头一致性，实测定位）；
 //   love.graphics._frOfflineReplay(path) → fr_offline_replay 的 rc。
 int w_frTakeSession(lua_State *L);
+int w_frTakeErrRows(lua_State *L);          // B8 T4：捕获期 err 行（log 段组装/sim 比对）
 int w_frCaptureSuspend(lua_State *L);   // B8 T3：观察侧围栏（配对 resume）
 int w_frCaptureResume(lua_State *L);
 int w_frTakeAssets(lua_State *L);
