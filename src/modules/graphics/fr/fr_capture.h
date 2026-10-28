@@ -166,6 +166,17 @@ love::uint32 fr_assetid(lua_State *L, int idx);
 void fr_set_current_font(love::uint32 id);
 love::uint32 fr_current_font();
 
+// B8 T2 绘制类五 op 捕获（cmd.tbl 封版签名；坐标经 getTransform 结算——
+// 调用方（w_* 钩）传已结算的世界系坐标）：
+void capture_line(const float *pts, love::uint32 n, float width, const love::Colorf &color);
+void capture_circle(love::uint8 mode, float x, float y, float r, love::uint32 seg,
+                    const love::Colorf &color);
+void capture_poly(love::uint8 mode, const float *pts, love::uint32 n,
+                  const love::Colorf &color);
+void capture_arc(love::uint8 mode, love::uint8 arctype, float x, float y, float r,
+                 float a1, float a2, love::uint32 seg, const love::Colorf &color);
+void capture_points(const float *pts, love::uint32 n, float size, const love::Colorf &color);
+
 // Lua 出口：
 //   love.graphics._frTakeSession() → out 段行文本数组；
 //   love.graphics._frTakeAssets()  → 资产行文本数组；

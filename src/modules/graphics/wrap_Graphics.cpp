@@ -2653,6 +2653,51 @@ int w_points(lua_State *L)
 	// - points({x1, y1, x2, y2, ...})
 	// - points({{x1, y1 [, r, g, b, a]}, {x2, y2 [, r, g, b, a]}, ...})
 
+	// B8 T2 捕获钩：flat 形态（裸参/平表）——单色全点；table-of-tables 带
+	// 逐点色形态超出 cmd.tbl 单 color 签名，捕获模式不支持（err 行归后续）。
+	if (fr::capture_enabled())
+	{
+		int args = lua_gettop(L);
+		bool is_table = (args == 1 && lua_istable(L, 1));
+		if (is_table) args = (int) luax_objlen(L, 1);
+		if (args == 1 && lua_istable(L, 1))
+		{
+			lua_rawgeti(L, 1, 1);
+			bool tot = lua_istable(L, -1);
+			lua_pop(L, 1);
+			if (tot) return luaL_error(L, "fr: points 逐点色形态暂不支持");
+		}
+		if (args % 2 != 0 || args < 2)
+			return luaL_error(L, "fr: points 参数须为偶数个坐标");
+
+		int n = args / 2;
+		std::vector<float> pts(n * 2);
+		for (int i = 0; i < n; i++)
+		{
+			if (is_table)
+			{
+				lua_rawgeti(L, 1, i * 2 + 1); lua_rawgeti(L, 1, i * 2 + 2);
+				pts[i * 2] = (float) luax_checkfloat(L, -2);
+				pts[i * 2 + 1] = (float) luax_checkfloat(L, -1);
+				lua_pop(L, 2);
+			}
+			else
+			{
+				pts[i * 2] = (float) luax_checkfloat(L, i * 2 + 1);
+				pts[i * 2 + 1] = (float) luax_checkfloat(L, i * 2 + 2);
+			}
+		}
+		const Matrix4 &t = instance()->getTransform();
+		for (int i = 0; i < n; i++)
+		{
+			Vector2 src(pts[i * 2], pts[i * 2 + 1]);
+			Vector2 dst; t.transformXY(&dst, &src, 1);
+			pts[i * 2] = dst.x; pts[i * 2 + 1] = dst.y;
+		}
+		fr::capture_points(pts.data(), n, 1.0f, instance()->getColor());
+		return 0;
+	}
+
 	int args = lua_gettop(L);
 	bool is_table = false;
 	bool is_table_of_tables = false;
@@ -2737,6 +2782,47 @@ int w_points(lua_State *L)
 
 int w_line(lua_State *L)
 {
+	// B8 T2 捕获钩：参数解析复用原实现（表/裸参双形态），坐标经 getTransform
+	// 结算后记行（cmd.tbl：line pts f32[] width f32 color rgba8）。
+	if (fr::capture_enabled())
+	{
+		int args = lua_gettop(L);
+		bool is_table = (args == 1 && lua_type(L, 1) == LUA_TTABLE);
+		if (is_table) args = (int) luax_objlen(L, 1);
+		if (args % 2 != 0 || args < 4)
+			return luaL_error(L, "line 参数须为偶数个坐标（至少两点）");
+
+		int n = args / 2;
+		std::vector<float> pts(n * 2);
+		for (int i = 0; i < n; i++)
+		{
+			if (is_table)
+			{
+				lua_rawgeti(L, 1, i * 2 + 1); lua_rawgeti(L, 1, i * 2 + 2);
+				pts[i * 2] = (float) luax_checkfloat(L, -2);
+				pts[i * 2 + 1] = (float) luax_checkfloat(L, -1);
+				lua_pop(L, 2);
+			}
+			else
+			{
+				pts[i * 2] = (float) luax_checkfloat(L, i * 2 + 1);
+				pts[i * 2 + 1] = (float) luax_checkfloat(L, i * 2 + 2);
+			}
+		}
+
+		const Matrix4 &t = instance()->getTransform();
+		for (int i = 0; i < n; i++)
+		{
+			Vector2 src(pts[i * 2], pts[i * 2 + 1]);
+			Vector2 dst;
+			t.transformXY(&dst, &src, 1);
+			pts[i * 2] = dst.x; pts[i * 2 + 1] = dst.y;
+		}
+
+		fr::capture_line(pts.data(), n, instance()->getLineWidth(), instance()->getColor());
+		return 0;
+	}
+
 	int args = lua_gettop(L);
 	int arg1type = lua_type(L, 1);
 	bool is_table = false;
@@ -2855,6 +2941,21 @@ int w_circle(lua_State *L)
 	if (!Graphics::getConstant(str, mode))
 		return luax_enumerror(L, "draw mode", Graphics::getConstants(mode), str);
 
+	// B8 T2 捕获钩（mode/xy/r/seg 解析复用，坐标结算后记行）。
+	if (fr::capture_enabled())
+	{
+		float x = (float) luaL_checknumber(L, 2);
+		float y = (float) luaL_checknumber(L, 3);
+		float radius = (float) luaL_checknumber(L, 4);
+		int seg = (int) luaL_optinteger(L, 5, 0);
+		const Matrix4 &t = instance()->getTransform();
+		Vector2 src(x, y), dst; t.transformXY(&dst, &src, 1);
+		fr::capture_circle(mode == Graphics::DRAW_FILL ? 0 : 1,
+		                   dst.x, dst.y, radius, (love::uint32) (seg > 0 ? seg : 32),
+		                   instance()->getColor());
+		return 0;
+	}
+
 	float x = (float)luaL_checknumber(L, 2);
 	float y = (float)luaL_checknumber(L, 3);
 	float radius = (float)luaL_checknumber(L, 4);
@@ -2913,6 +3014,25 @@ int w_arc(lua_State *L)
 		startidx = 3;
 	}
 
+	// B8 T2 捕获钩（arc mode/draw mode/xy/r/角度对/seg；arctype 0=pie 1=open 2=closed）。
+	if (fr::capture_enabled())
+	{
+		float x = (float) luaL_checknumber(L, startidx + 0);
+		float y = (float) luaL_checknumber(L, startidx + 1);
+		float radius = (float) luaL_checknumber(L, startidx + 2);
+		float a1 = (float) luaL_checknumber(L, startidx + 3);
+		float a2 = (float) luaL_checknumber(L, startidx + 4);
+		int seg = (int) luaL_optinteger(L, startidx + 5, 0);
+		const Matrix4 &t = instance()->getTransform();
+		Vector2 src(x, y), dst; t.transformXY(&dst, &src, 1);
+		love::uint8 at = (arcmode == Graphics::ARC_OPEN) ? 1
+		              : (arcmode == Graphics::ARC_CLOSED) ? 2 : 0;
+		fr::capture_arc(drawmode == Graphics::DRAW_FILL ? 0 : 1, at,
+		                dst.x, dst.y, radius, a1, a2,
+		                (love::uint32) (seg > 0 ? seg : 16), instance()->getColor());
+		return 0;
+	}
+
 	float x = (float) luaL_checknumber(L, startidx + 0);
 	float y = (float) luaL_checknumber(L, startidx + 1);
 	float radius = (float) luaL_checknumber(L, startidx + 2);
@@ -2950,6 +3070,39 @@ int w_polygon(lua_State *L)
 		return luaL_error(L, "Number of vertex components must be a multiple of two");
 	else if (args < 6)
 		return luaL_error(L, "Need at least three vertices to draw a polygon");
+
+	// B8 T2 捕获钩（解析复用，坐标结算后记行——不含闭合点，cmd.tbl 口径）。
+	if (fr::capture_enabled())
+	{
+		int n = args / 2;
+		std::vector<float> pts(n * 2);
+		for (int i = 0; i < n; i++)
+		{
+			float vx, vy;
+			if (is_table)
+			{
+				lua_rawgeti(L, 2, i * 2 + 1); lua_rawgeti(L, 2, i * 2 + 2);
+				vx = (float) luax_checkfloat(L, -2); vy = (float) luax_checkfloat(L, -1);
+				lua_pop(L, 2);
+			}
+			else
+			{
+				vx = (float) luax_checkfloat(L, i * 2 + 2);
+				vy = (float) luax_checkfloat(L, i * 2 + 3);
+			}
+			pts[i * 2] = vx; pts[i * 2 + 1] = vy;
+		}
+		const Matrix4 &t = instance()->getTransform();
+		for (int i = 0; i < n; i++)
+		{
+			Vector2 src(pts[i * 2], pts[i * 2 + 1]);
+			Vector2 dst; t.transformXY(&dst, &src, 1);
+			pts[i * 2] = dst.x; pts[i * 2 + 1] = dst.y;
+		}
+		fr::capture_poly(mode == Graphics::DRAW_FILL ? 0 : 1,
+		                 pts.data(), n, instance()->getColor());
+		return 0;
+	}
 
 	int numvertices = args / 2;
 

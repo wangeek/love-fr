@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <sstream>
 #include <cstring>
 
 // modules/font/Font.cpp 的默认字体：在 love::font 命名空间内 include
@@ -234,6 +235,72 @@ void capture_rect(love::uint8 mode, float x, float y, float w, float h, float rx
 	rows().push_back(render_rect_row(mode, x, y, w, h, rx, ry, width,
 	                                 rgba8(color.r), rgba8(color.g),
 	                                 rgba8(color.b), rgba8(color.a)));
+}
+
+// B8 T2 绘制类五 op（cmd.tbl 封版签名；行格式与 render_line/circle 等
+// Python 侧 canonical 对齐——f32 恒 %.6f、pts 前带点数）。
+static std::string fmt_f(float v)
+{
+	char buf[64];
+	snprintf(buf, sizeof(buf), "%.6f", v);
+	return buf;
+}
+
+static std::string render_pts(const float *pts, love::uint32 n)
+{
+	std::string s = std::to_string(n);
+	for (love::uint32 i = 0; i < n * 2; i++)
+		s += " " + fmt_f(pts[i]);
+	return s;
+}
+
+void capture_line(const float *pts, love::uint32 n, float width, const love::Colorf &color)
+{
+	std::string row = "line " + render_pts(pts, n)
+		+ " " + fmt_f(width)
+		+ " " + std::to_string(rgba8(color.r)) + " " + std::to_string(rgba8(color.g))
+		+ " " + std::to_string(rgba8(color.b)) + " " + std::to_string(rgba8(color.a));
+	rows().push_back(row);
+}
+
+void capture_circle(love::uint8 mode, float x, float y, float r, love::uint32 seg,
+                    const love::Colorf &color)
+{
+	char buf[160];
+	snprintf(buf, sizeof(buf), "circle %u %s %s %s %u %d %d %d %d",
+	         (unsigned) mode, fmt_f(x).c_str(), fmt_f(y).c_str(), fmt_f(r).c_str(),
+	         (unsigned) seg, rgba8(color.r), rgba8(color.g), rgba8(color.b), rgba8(color.a));
+	rows().push_back(buf);
+}
+
+void capture_poly(love::uint8 mode, const float *pts, love::uint32 n,
+                  const love::Colorf &color)
+{
+	std::string row = "poly " + std::to_string((unsigned) mode) + " " + render_pts(pts, n)
+		+ " " + std::to_string(rgba8(color.r)) + " " + std::to_string(rgba8(color.g))
+		+ " " + std::to_string(rgba8(color.b)) + " " + std::to_string(rgba8(color.a));
+	rows().push_back(row);
+}
+
+void capture_arc(love::uint8 mode, love::uint8 arctype, float x, float y, float r,
+                 float a1, float a2, love::uint32 seg, const love::Colorf &color)
+{
+	char buf[200];
+	snprintf(buf, sizeof(buf), "arc %u %u %s %s %s %s %s %u %d %d %d %d",
+	         (unsigned) mode, (unsigned) arctype,
+	         fmt_f(x).c_str(), fmt_f(y).c_str(), fmt_f(r).c_str(),
+	         fmt_f(a1).c_str(), fmt_f(a2).c_str(), (unsigned) seg,
+	         rgba8(color.r), rgba8(color.g), rgba8(color.b), rgba8(color.a));
+	rows().push_back(buf);
+}
+
+void capture_points(const float *pts, love::uint32 n, float size, const love::Colorf &color)
+{
+	std::string row = "points " + render_pts(pts, n)
+		+ " " + fmt_f(size)
+		+ " " + std::to_string(rgba8(color.r)) + " " + std::to_string(rgba8(color.g))
+		+ " " + std::to_string(rgba8(color.b)) + " " + std::to_string(rgba8(color.a));
+	rows().push_back(row);
 }
 
 // ------------------------------------------------------------------
@@ -670,6 +737,137 @@ void capture_exec_row(love::graphics::Graphics *gfx, const std::string &row)
 				gfx->rectangle(m, x, y, w, h);
 		}
 	}
+	else if (row.compare(0, 5, "line ") == 0)
+	{
+		// `line <n> <x1> <y1> ... <width> <rgba>`——逐 token 数值化（可变点数）。
+		std::vector<float> vals;
+		{
+			std::istringstream iss(row);
+			std::string tag;
+			iss >> tag;
+			float v;
+			while (iss >> v) vals.push_back(v);
+		}
+		if (vals.size() >= 7) // n + 2n coords + width + 4 color = 3n+5 ≥ 11... but n itself is vals[0]
+		{
+			unsigned n = (unsigned) vals[0];
+			if (n >= 1 && vals.size() >= (size_t) (1 + n * 2 + 5))
+			{
+				float width = vals[1 + n * 2];
+				int r = (int) vals[1 + n * 2 + 1];
+				int g = (int) vals[1 + n * 2 + 2];
+				int b = (int) vals[1 + n * 2 + 3];
+				int a = (int) vals[1 + n * 2 + 4];
+				std::vector<love::Vector2> pts(n);
+				for (unsigned i = 0; i < n; i++)
+				{
+					pts[i].x = vals[1 + i * 2];
+					pts[i].y = vals[1 + i * 2 + 1];
+				}
+				gfx->setColor(love::Colorf(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f));
+				gfx->setLineWidth(width);
+				gfx->polyline(pts.data(), n);
+			}
+		}
+	}
+	else if (row.compare(0, 7, "circle ") == 0)
+	{
+		unsigned mode = 0, seg = 32;
+		float x = 0, y = 0, r = 0;
+		int cr = 0, cg = 0, cb = 0, ca = 255;
+		if (sscanf(row.c_str(), "circle %u %f %f %f %u %d %d %d %d",
+		           &mode, &x, &y, &r, &seg, &cr, &cg, &cb, &ca) == 9)
+		{
+			gfx->setColor(love::Colorf(cr / 255.0f, cg / 255.0f, cb / 255.0f, ca / 255.0f));
+			gfx->circle(mode == 0 ? love::graphics::Graphics::DRAW_FILL
+			                      : love::graphics::Graphics::DRAW_LINE,
+			            x, y, r, (int) seg);
+		}
+	}
+	else if (row.compare(0, 5, "poly ") == 0)
+	{
+		std::vector<float> vals;
+		{
+			std::istringstream iss(row);
+			std::string tag;
+			iss >> tag;
+			float v;
+			while (iss >> v) vals.push_back(v);
+		}
+		if (vals.size() >= 6) // mode + n + 2n coords + 4 color
+		{
+			unsigned mode = (unsigned) vals[0];
+			unsigned n = (unsigned) vals[1];
+			if (n >= 3 && vals.size() >= (size_t) (2 + n * 2 + 4))
+			{
+				int r = (int) vals[2 + n * 2];
+				int g = (int) vals[2 + n * 2 + 1];
+				int b = (int) vals[2 + n * 2 + 2];
+				int a = (int) vals[2 + n * 2 + 3];
+				std::vector<love::Vector2> pts(n + 1); // 闭合
+				for (unsigned i = 0; i < n; i++)
+				{
+					pts[i].x = vals[2 + i * 2];
+					pts[i].y = vals[2 + i * 2 + 1];
+				}
+				pts[n] = pts[0];
+				gfx->setColor(love::Colorf(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f));
+				gfx->polygon(mode == 0 ? love::graphics::Graphics::DRAW_FILL
+				                       : love::graphics::Graphics::DRAW_LINE,
+				             pts.data(), n + 1);
+			}
+		}
+	}
+	else if (row.compare(0, 4, "arc ") == 0)
+	{
+		unsigned mode = 0, at = 0, seg = 16;
+		float x = 0, y = 0, r = 0, a1 = 0, a2 = 0;
+		int cr = 0, cg = 0, cb = 0, ca = 255;
+		if (sscanf(row.c_str(), "arc %u %u %f %f %f %f %f %u %d %d %d %d",
+		           &mode, &at, &x, &y, &r, &a1, &a2, &seg, &cr, &cg, &cb, &ca) == 12)
+		{
+			gfx->setColor(love::Colorf(cr / 255.0f, cg / 255.0f, cb / 255.0f, ca / 255.0f));
+			gfx->arc(mode == 0 ? love::graphics::Graphics::DRAW_FILL
+			                   : love::graphics::Graphics::DRAW_LINE,
+			         (at == 1) ? love::graphics::Graphics::ARC_OPEN
+			         : (at == 2) ? love::graphics::Graphics::ARC_CLOSED
+			                     : love::graphics::Graphics::ARC_PIE,
+			         x, y, r, a1, a2, (int) seg);
+		}
+	}
+	else if (row.compare(0, 7, "points ") == 0)
+	{
+		std::vector<float> vals;
+		{
+			std::istringstream iss(row);
+			std::string tag;
+			iss >> tag;
+			float v;
+			while (iss >> v) vals.push_back(v);
+		}
+		if (vals.size() >= 7) // n + 2n coords + size + 4 color
+		{
+			unsigned n = (unsigned) vals[0];
+			if (n >= 1 && vals.size() >= (size_t) (1 + n * 2 + 5))
+			{
+				float size = vals[1 + n * 2];
+				int r = (int) vals[1 + n * 2 + 1];
+				int g = (int) vals[1 + n * 2 + 2];
+				int b = (int) vals[1 + n * 2 + 3];
+				int a = (int) vals[1 + n * 2 + 4];
+				gfx->setColor(love::Colorf(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f));
+				gfx->setPointSize(size);
+				std::vector<love::Vector2> pts(n);
+				for (unsigned i = 0; i < n; i++)
+				{
+					pts[i].x = vals[1 + i * 2];
+					pts[i].y = vals[1 + i * 2 + 1];
+				}
+				std::vector<love::Colorf> cols(n, love::Colorf(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f));
+				gfx->points(pts.data(), cols.data(), n);
+			}
+		}
+	}
 }
 
 void capture_replay(love::graphics::Graphics *gfx)
@@ -924,12 +1122,15 @@ static int offline_parse_text(const std::string &buf, OfflineSession &s)
 			continue;
 		}
 		if (ln.compare(0, 6, "clear ") == 0 || ln.compare(0, 5, "draw ") == 0
-		    || ln.compare(0, 6, "print ") == 0 || ln.compare(0, 5, "rect ") == 0)
+		    || ln.compare(0, 6, "print ") == 0 || ln.compare(0, 5, "rect ") == 0
+		    || ln.compare(0, 5, "line ") == 0 || ln.compare(0, 7, "circle ") == 0
+		    || ln.compare(0, 5, "poly ") == 0 || ln.compare(0, 4, "arc ") == 0
+		    || ln.compare(0, 7, "points ") == 0)
 		{
 			s.frames.back().push_back(ln);
 			continue;
 		}
-		std::fprintf(stderr, "fr-offline: 第 %d 行：离线回放不支持的非 out 行（B4 op 域）\n", no);
+		std::fprintf(stderr, "fr-offline: 第 %d 行：离线回放不支持的非 out 行（B8 op 域）\n", no);
 		return 3;
 	}
 	return 0;
@@ -1062,9 +1263,100 @@ static int offline_parse_frame_body(const love::uint8 *body, size_t n, size_t ba
 			                                   c.r, c.g, c.b, c.a));
 			break;
 		}
+		case FR_OP_LINE:
+		{
+			// line pts f32[] width f32 color rgba8
+			love::uint32 n = 0;
+			float pbuf[512]; const float *pf = pbuf;
+			float width = 0;
+			fr_rgba8 c;
+			if (fr_dec_pts(&d, pbuf, 512, &n) != 0) break;
+			width = fr_dec_f32(&d);
+			if (fr_dec_rgba8(&d, &c) != 0) break;
+			std::string row = "line " + std::to_string(n);
+			for (love::uint32 i = 0; i < n * 2; i++)
+			{
+				char b[32]; snprintf(b, sizeof(b), " %.6f", pf[i]);
+				row += b;
+			}
+			char tail[48];
+			snprintf(tail, sizeof(tail), " %.6f %d %d %d %d", width, (int) c.r, (int) c.g, (int) c.b, (int) c.a);
+			row += tail;
+			out_rows.push_back(row);
+			break;
+		}
+		case FR_OP_CIRCLE:
+		{
+			love::uint8 mode = fr_dec_u8(&d);
+			float x = fr_dec_f32(&d), y = fr_dec_f32(&d), r = fr_dec_f32(&d);
+			love::uint32 seg = fr_dec_u32(&d);
+			fr_rgba8 c;
+			if (fr_dec_rgba8(&d, &c) != 0) break;
+			char buf[160];
+			snprintf(buf, sizeof(buf), "circle %u %.6f %.6f %.6f %u %d %d %d %d",
+			         (unsigned) mode, x, y, r, (unsigned) seg, (int) c.r, (int) c.g, (int) c.b, (int) c.a);
+			out_rows.push_back(buf);
+			break;
+		}
+		case FR_OP_POLY:
+		{
+			love::uint8 mode = fr_dec_u8(&d);
+			love::uint32 n = 0;
+			float pbuf[512]; const float *pf = pbuf;
+			fr_rgba8 c;
+			if (fr_dec_pts(&d, pbuf, 512, &n) != 0) break;
+			if (fr_dec_rgba8(&d, &c) != 0) break;
+			std::string row = "poly " + std::to_string((unsigned) mode) + " " + std::to_string(n);
+			for (love::uint32 i = 0; i < n * 2; i++)
+			{
+				char b[32]; snprintf(b, sizeof(b), " %.6f", pf[i]);
+				row += b;
+			}
+			char tail[32];
+			snprintf(tail, sizeof(tail), " %d %d %d %d", (int) c.r, (int) c.g, (int) c.b, (int) c.a);
+			row += tail;
+			out_rows.push_back(row);
+			break;
+		}
+		case FR_OP_ARC:
+		{
+			love::uint8 mode = fr_dec_u8(&d), arctype = fr_dec_u8(&d);
+			float x = fr_dec_f32(&d), y = fr_dec_f32(&d), r = fr_dec_f32(&d);
+			float a1 = fr_dec_f32(&d), a2 = fr_dec_f32(&d);
+			love::uint32 seg = fr_dec_u32(&d);
+			fr_rgba8 c;
+			if (fr_dec_rgba8(&d, &c) != 0) break;
+			char buf[200];
+			snprintf(buf, sizeof(buf), "arc %u %u %.6f %.6f %.6f %.6f %.6f %u %d %d %d %d",
+			         (unsigned) mode, (unsigned) arctype, x, y, r, a1, a2,
+			         (unsigned) seg, (int) c.r, (int) c.g, (int) c.b, (int) c.a);
+			out_rows.push_back(buf);
+			break;
+		}
+		case FR_OP_POINTS:
+		{
+			love::uint32 n = 0;
+			float pbuf[512]; const float *pf = pbuf;
+			float size = 0;
+			fr_rgba8 c;
+			if (fr_dec_pts(&d, pbuf, 512, &n) != 0) break;
+			size = fr_dec_f32(&d);
+			if (fr_dec_rgba8(&d, &c) != 0) break;
+			std::string row = "points " + std::to_string(n);
+			for (love::uint32 i = 0; i < n * 2; i++)
+			{
+				char b[32]; snprintf(b, sizeof(b), " %.6f", pf[i]);
+				row += b;
+			}
+			char tail[48];
+			snprintf(tail, sizeof(tail), " %.6f %d %d %d %d", size, (int) c.r, (int) c.g, (int) c.b, (int) c.a);
+			row += tail;
+			out_rows.push_back(row);
+			break;
+		}
 		default:
 			std::fprintf(stderr, "fr-offline: off %d：离线回放不支持的非 out 行 "
-			             "opcode 0x%02X（B4 op 域）\n", (int) (base + d.off - 1), d.op);
+			             "opcode 0x%02X（B8 op 域）\n", (int) (base + d.off - 1), d.op);
 			return 3;
 		}
 

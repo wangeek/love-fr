@@ -42,6 +42,19 @@ function kernel.draw(g, assets)
 		love.graphics.setLineWidth(3)
 		love.graphics.rectangle("line", 500.0, 200.0, 40.0, 20.0)
 		love.graphics.setColor(1, 1, 1, 1)          -- 复位（后续帧点击标记仍白）
+
+		-- B8 T2 绘制类五 op（原生调用，坐标避验证帧三点像素锚）
+		love.graphics.setColor(0, 1, 1, 1)          -- 青
+		love.graphics.line(80.0, 60.0, 120.0, 90.0)
+		love.graphics.setLineWidth(2)
+		love.graphics.line(80.0, 60.0, 120.0, 90.0) -- 青线宽 2
+		love.graphics.setColor(1, 0, 0, 1)          -- 红
+		love.graphics.circle("fill", 600.0, 400.0, 15.0, 32)
+		love.graphics.setColor(1, 1, 0, 1)          -- 黄
+		love.graphics.polygon("fill", 40.0, 100.0, 60.0, 140.0, 20.0, 140.0)
+		love.graphics.setColor(0, 1, 1, 1)          -- 青
+		love.graphics.arc("fill", "pie", 300.0, 200.0, 25.0, 0.0, 1.570796, 16)
+		love.graphics.setColor(1, 1, 1, 1)          -- 复位
 	end
 end
 
