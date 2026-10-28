@@ -1810,6 +1810,15 @@ int w_setNewFont(lua_State *L)
 
 int w_setFont(lua_State *L)
 {
+	// B8 T1 字体状态跟踪：参数为 fr 代理时记 id 即返回（代理非 Font 类型，
+	// luax_checktype 会抛错——捕获模式 print 被抑制无需真字体，回放侧由
+	// 物化器自建）。
+	if (fr::capture_enabled() && fr::fr_isasset(L, 1))
+	{
+		fr::fr_set_current_font(fr::fr_assetid(L, 1));
+		return 0;
+	}
+
 	Font *font = luax_checktype<Font>(L, 1);
 	instance()->setFont(font);
 	return 0;
@@ -2519,6 +2528,11 @@ int w_print(lua_State *L)
 		{
 			fontid = fr::fr_assetid(L, 2);
 			startidx = 3;
+		}
+		else
+		{
+			// B8 T1：原生形态（print 不传 font）→ 回退 setFont 状态。
+			fontid = fr::fr_current_font();
 		}
 
 		if (luax_istype(L, startidx, math::Transform::type))

@@ -360,6 +360,12 @@ love::uint32 fr_assetid(lua_State *L, int idx)
 	return p != nullptr ? p->id : 0;
 }
 
+// B8 T1 字体状态（w_setFont 挂钩记录 / w_print 未传 font 时回退）。
+static love::uint32 s_current_font = 0;
+
+void fr_set_current_font(love::uint32 id) { s_current_font = id; }
+love::uint32 fr_current_font() { return s_current_font; }
+
 static love::uint32 register_asset(const FrAsset &a)
 {
 	assets().push_back(a);
@@ -657,6 +663,7 @@ void capture_exec_row(love::graphics::Graphics *gfx, const std::string &row)
 				(mode == 0) ? love::graphics::Graphics::DRAW_FILL
 				            : love::graphics::Graphics::DRAW_LINE;
 			gfx->setColor(love::Colorf(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f));
+			gfx->setLineWidth(width); // B8 T1：行内线宽应用（live/离线状态对齐）
 			if (rx > 0.0f || ry > 0.0f)
 				gfx->rectangle(m, x, y, w, h, rx, ry); // 圆角 points 缺省（行内无此字段）
 			else

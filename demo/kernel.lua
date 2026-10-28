@@ -20,7 +20,7 @@ function kernel.update(dt)
 	if s.hero.x > 600 then s.hero.x = 600.0 end
 end
 
-function kernel.draw(g)
+function kernel.draw(g, assets)
 	g.clear(0, 0, 0, 255)
 	g.draw(1, 0, kernel.state.hero.x, kernel.state.hero.y, 0, 1, 1, 0, 0, 255, 255, 255, 255)
 	g.print(2, kernel.state.banner, 12.0, 340.0, 0, 1, 1, 255, 255, 0, 255)
@@ -30,6 +30,18 @@ function kernel.draw(g)
 	-- 不与标记区重叠，注入路径不破既有像素判据。
 	for _, c in ipairs(kernel.state.clicks) do
 		g.rectangle(0, c.x - 4.0, c.y - 4.0, 8.0, 8.0, 0.0, 0.0, 1.0, 255, 255, 255, 255)
+	end
+
+	-- B8 T1 原生 API 序列（真实游戏形态，不经 ir_graphics 适配层）：
+	-- setColor/setLineWidth 状态折参（真状态机）+ setFont 状态跟踪 + print
+	-- 不传 font。几何避开验证帧三点像素锚 (400,100)/(20,30)/(320,468)。
+	if assets then
+		love.graphics.setFont(assets[2])          -- 代理 → fr 状态记 id=2
+		love.graphics.setColor(0, 1, 0, 1)          -- 绿（0-1 域，原生语义）
+		love.graphics.print("N8", 500.0, 10.0)     -- 不传 font → setFont 状态
+		love.graphics.setLineWidth(3)
+		love.graphics.rectangle("line", 500.0, 200.0, 40.0, 20.0)
+		love.graphics.setColor(1, 1, 1, 1)          -- 复位（后续帧点击标记仍白）
 	end
 end
 

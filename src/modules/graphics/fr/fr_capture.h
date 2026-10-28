@@ -160,6 +160,12 @@ int w_frNewQuad(lua_State *L);
 bool fr_isasset(lua_State *L, int idx);
 love::uint32 fr_assetid(lua_State *L, int idx);
 
+// B8 T1 字体状态跟踪：w_setFont 挂钩在真 setFont 之外，参数为代理时记
+// 其 id；w_print 未传 font（无代理形参）时回退该状态（原生游戏形态：
+// love.graphics.setFont(f) + love.graphics.print(text, x, y)）。
+void fr_set_current_font(love::uint32 id);
+love::uint32 fr_current_font();
+
 // Lua 出口：
 //   love.graphics._frTakeSession() → out 段行文本数组；
 //   love.graphics._frTakeAssets()  → 资产行文本数组；

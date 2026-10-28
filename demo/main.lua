@@ -292,7 +292,7 @@ function love.update(dt)
 end
 
 function love.draw()
-	kernel.draw(ir_graphics)
+	kernel.draw(ir_graphics, FR_ASSETS)
 end
 
 local VERIFY_FRAME = 3
@@ -479,7 +479,7 @@ end
 -- 独立帧循环（不跑 love.run/verify_frame）：读 .fr 文本流 → 逐帧把 ev 行
 -- 还原为 Lua 值 push 进事件队列（与录制同链路：帧首 push → pump → poll
 -- 取出 → 分发 kernel.handlers）→ kernel.update（dt 取流行，FIXED_DT 不用
--- ——重演吃录制的 dt）→ kernel.draw(ir_graphics)（FR_CAPTURE=1 捕获再生
+-- ——重演吃录制的 dt）→ kernel.draw(ir_graphics, FR_ASSETS)（FR_CAPTURE=1 捕获再生
 -- out 行）→ 与录制 out 行逐行比对。纯行比对无 Canvas 回读——GL-free，
 -- FR_HEADLESS=1 可同用。stdout 逐帧 `SIM <frame> MATCH|MISMATCH <ndiff>
 -- | REC: <首差异录制行> | GEN: <首差异再生行>`（缺侧记 "-"；ev 条数漂移
@@ -682,7 +682,7 @@ if SIM_PATH then
 			end
 			-- ③ update 吃录制 dt → draw 捕获再生行
 			kernel.update(fr.dt)
-			kernel.draw(ir_graphics)
+			kernel.draw(ir_graphics, FR_ASSETS)
 			-- B6 状态 CRC（Task 1b 子图口径）：present 等价点收集，与录制侧
 			-- 同一出口（_frStateSubCRC，根已载入期登记）——子图只含
 			-- kernel.state，本进程 parse/簿记表不进 CRC，跨进程等值可达；
