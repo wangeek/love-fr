@@ -144,6 +144,15 @@ love::uint32 fr_state_crc(lua_State *L)
 	}
 
 	crc_mix_u32(crc, ntab); // 对象计数收尾混入（表数变化即改 CRC）
+	// B12 观测护栏：全堆规模一次性统计（无注册根回退路径）。
+	{
+		static bool reported = false;
+		if (!reported)
+		{
+			std::fprintf(stderr, "fr: s_crc 全堆规模 %u 表（未注册根回退）\n", ntab);
+			reported = true;
+		}
+	}
 	return crc ^ 0xFFFFFFFFu; // xorout
 }
 
@@ -254,6 +263,13 @@ love::uint32 fr_state_sub_crc(lua_State *L)
 		crc_mix_u32(crc, sub_table_crc(tabV(tv), ctx));
 		crc_mix_u32(crc, ctx.ntab); // 到达表数收尾混入（结构敏感性，全堆口径同款）
 		crc ^= 0xFFFFFFFFu;
+		// B12 观测护栏：子图规模一次性统计（与全堆口径对比用）。
+		static bool reported = false;
+		if (!reported)
+		{
+			std::fprintf(stderr, "fr: s_crc 子图规模 %u 表（注册根可达）\n", ctx.ntab);
+			reported = true;
+		}
 		if (ctx.cycle)
 			fprintf(stderr, "fr_statediff: state root 子图含环（环槽按 0xC1C1E1E1 计，防御路径）\n");
 	}
