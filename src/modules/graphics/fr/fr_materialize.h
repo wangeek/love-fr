@@ -36,6 +36,7 @@ namespace graphics
 class Graphics;
 class Image;
 class Font;
+class Canvas;
 } // graphics
 } // love
 
@@ -47,5 +48,8 @@ love::graphics::Image *fr_materialize_image(love::graphics::Graphics *gfx, love:
 
 // 登记资产 id → 真 Font（缓存所有，nullptr = 不可物化）。
 love::graphics::Font *fr_materialize_font(love::graphics::Graphics *gfx, love::uint32 id);
+
+// 登记资产 id → 真 Canvas（B8 T3：rt 行回放目标；缓存所有）。
+love::graphics::Canvas *fr_materialize_canvas(love::graphics::Graphics *gfx, love::uint32 id);
 
 } // fr

@@ -109,7 +109,13 @@ void capture_replay(love::graphics::Graphics *gfx);
 
 // 单行执行（capture_replay 的 per-row 内核）：拓扑 B 离线回放与 tee₂ 回放
 // 共用同一行执行入口（物化器/真渲染同构的关键，B4 阶段三 Task 3）。
+// B8 T3：rt 0 的"屏幕" = 回放会话基线目标（两回放驱动进出配对设置）。
 void capture_exec_row(love::graphics::Graphics *gfx, const std::string &row);
+
+// B8 T3：观察侧围栏——suspend 计数 >0 时 capture_enabled()=false（挂钩全
+// 旁路=真执行零记录）。验证帧 rig 的真 Canvas 切换是观察机器，不进内核流。
+void capture_suspend();
+void capture_resume();
 
 // out 段行文本（draw/print/rect/clear）。
 std::vector<std::string> capture_take_rows();
@@ -177,6 +183,12 @@ void capture_arc(love::uint8 mode, love::uint8 arctype, float x, float y, float 
                  float a1, float a2, love::uint32 seg, const love::Colorf &color);
 void capture_points(const float *pts, love::uint32 n, float size, const love::Colorf &color);
 
+// B8 T3 目标/裁剪/Shader 边界：
+void capture_rt(love::uint32 target);          // setCanvas → rt 行（0=屏幕）
+void capture_scissor(float x, float y, float w, float h); // -1 哨兵=off
+void capture_shader_boundary();                 // setShader → err 行（语义边界）
+int fr_asset_kind_of(love::uint32 id);          // 资产号 → kind（0=未登记）
+
 // Lua 出口：
 //   love.graphics._frTakeSession() → out 段行文本数组；
 //   love.graphics._frTakeAssets()  → 资产行文本数组；
@@ -195,6 +207,8 @@ void capture_points(const float *pts, love::uint32 n, float size, const love::Co
 //       表，污染末帧 s_crc 的窗口/无头一致性，实测定位）；
 //   love.graphics._frOfflineReplay(path) → fr_offline_replay 的 rc。
 int w_frTakeSession(lua_State *L);
+int w_frCaptureSuspend(lua_State *L);   // B8 T3：观察侧围栏（配对 resume）
+int w_frCaptureResume(lua_State *L);
 int w_frTakeAssets(lua_State *L);
 int w_frReplay(lua_State *L);
 int w_frNewCanvasReal(lua_State *L);

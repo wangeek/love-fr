@@ -298,6 +298,31 @@ int w_setCanvas(lua_State *L)
 	// Disable stencil writes.
 	luax_catchexcept(L, [](){ instance()->stopDrawToStencilBuffer(); });
 
+	// B8 T3 捕获钩：setCanvas → rt 行（代理=canvas 资产号；nil=0 屏幕；
+	// 真对象 err 边界——demo 单目标）。捕获态零真执行：真目标切换归回放侧
+	// rt 行（exec 带会话基线）——draw 期真切换会劫持验证帧回放目标（实测）。
+	if (fr::capture_enabled())
+	{
+		if (lua_isnoneornil(L, 1))
+		{
+			fr::capture_rt(0);
+			return 0;
+		}
+		if (fr::fr_isasset(L, 1) && !lua_istable(L, 1))
+		{
+			love::uint32 target = fr::fr_assetid(L, 1);
+			if (target == 0 || fr::fr_asset_kind_of(target) != fr::FR_ASSET_CANVAS)
+				return luaL_error(L, "fr: setCanvas 捕获参数须为 canvas 代理");
+			fr::capture_rt(target);
+			// 语义替代版 canvas 不建真 Canvas——真 setCanvas 无法吃代理。
+			// 真执行跳过（离线回放侧由 rt 行驱动执行路径），登记边界。
+			return 0;
+		}
+		// 非代理非 nil（真 Canvas/多目标表）：真执行 + err 边界
+		fr::capture_shader_boundary();
+		// fallthrough 到真执行
+	}
+
 	// called with none -> reset to default buffer
 	if (lua_isnoneornil(L, 1))
 	{
@@ -585,6 +610,26 @@ int w_captureScreenshot(lua_State *L)
 int w_setScissor(lua_State *L)
 {
 	int nargs = lua_gettop(L);
+
+	// B8 T3 捕获钩：scissor 行（off = -1 哨兵）；捕获态零真执行（状态归
+	// 回放侧 scissor 行重演，与 setCanvas 同纪律）。
+	if (fr::capture_enabled())
+	{
+		if (nargs == 0 || (nargs == 4 && lua_isnil(L, 1) && lua_isnil(L, 2)
+			&& lua_isnil(L, 3) && lua_isnil(L, 4)))
+		{
+			fr::capture_scissor(-1.0f, -1.0f, -1.0f, -1.0f);
+			return 0;
+		}
+		int sx = (int) luaL_checkinteger(L, 1);
+		int sy = (int) luaL_checkinteger(L, 2);
+		int sw = (int) luaL_checkinteger(L, 3);
+		int sh = (int) luaL_checkinteger(L, 4);
+		if (sw < 0 || sh < 0)
+			return luaL_error(L, "Can't set scissor with negative width and/or height.");
+		fr::capture_scissor((float) sx, (float) sy, (float) sw, (float) sh);
+		return 0;
+	}
 
 	if (nargs == 0 || (nargs == 4 && lua_isnil(L, 1) && lua_isnil(L, 2)
 		&& lua_isnil(L, 3) && lua_isnil(L, 4)))
@@ -2134,6 +2179,12 @@ int w_isWireframe(lua_State *L)
 
 int w_setShader(lua_State *L)
 {
+	// B8 T3 捕获钩：Shader 无 IR 表达——err 行登记语义边界（含 nil 复位），
+	// 真执行不抑制（shader 影响后续 draw 着色——捕获行 color 不含 shader 效果，
+	// 语义边界如实登记）。
+	if (fr::capture_enabled())
+		fr::capture_shader_boundary();
+
 	if (lua_isnoneornil(L,1))
 	{
 		instance()->setShader();
@@ -3255,6 +3306,8 @@ static const luaL_Reg functions[] =
 
 	// B4-2 FR 捕获层出口（fork 魔改，fr_capture.h）。
 	{ "_frTakeSession", fr::w_frTakeSession },
+	{ "_frCaptureSuspend", fr::w_frCaptureSuspend }, // B8 T3：观察侧围栏（rig 机器行不进内核流）
+	{ "_frCaptureResume", fr::w_frCaptureResume },
 	{ "_frTakeAssets", fr::w_frTakeAssets },
 	{ "_frReplay", fr::w_frReplay },
 	{ "_frNewCanvasReal", fr::w_frNewCanvasReal },

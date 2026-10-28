@@ -52,6 +52,11 @@ static std::vector<std::string> &asset_rows()
 	return r;
 }
 
+// B8 T3：观察侧围栏计数——>0 时挂钩全旁路（真执行、零记录）。验证帧 rig
+// 的真 Canvas 切换（setCanvas(c)/setCanvas()）是观察机器，不得进内核会话流
+//（多 VM 原则：观察机器不进被观测流）。
+static int g_suspend = 0;
+
 bool capture_enabled()
 {
 	static const bool enabled = []()
@@ -59,7 +64,18 @@ bool capture_enabled()
 		const char *v = getenv("FR_CAPTURE");
 		return v != nullptr && std::string(v) == "1";
 	}();
-	return enabled;
+	return enabled && g_suspend == 0;
+}
+
+void capture_suspend()
+{
+	g_suspend++;
+}
+
+void capture_resume()
+{
+	if (g_suspend > 0)
+		g_suspend--;
 }
 
 // ------------------------------------------------------------------
@@ -187,6 +203,21 @@ static std::string render_rect_row(love::uint8 mode, float x, float y, float w, 
 	return buf;
 }
 
+// B8 T3：rt/scissor 行文本（捕获与二进制离线重渲染共用——单一产行源）。
+static std::string render_rt_row(love::uint32 target)
+{
+	char buf[32];
+	snprintf(buf, sizeof(buf), "rt %u", (unsigned) target);
+	return buf;
+}
+
+static std::string render_scissor_row(float x, float y, float w, float h)
+{
+	char buf[128];
+	snprintf(buf, sizeof(buf), "scissor %.6f %.6f %.6f %.6f", x, y, w, h);
+	return buf;
+}
+
 // ------------------------------------------------------------------
 // 捕获点（clear + Task 3 draw/print/rect）
 // ------------------------------------------------------------------
@@ -301,6 +332,21 @@ void capture_points(const float *pts, love::uint32 n, float size, const love::Co
 		+ " " + std::to_string(rgba8(color.r)) + " " + std::to_string(rgba8(color.g))
 		+ " " + std::to_string(rgba8(color.b)) + " " + std::to_string(rgba8(color.a));
 	rows().push_back(row);
+}
+
+void capture_rt(love::uint32 target)
+{
+	rows().push_back(render_rt_row(target));
+}
+
+void capture_scissor(float x, float y, float w, float h)
+{
+	rows().push_back(render_scissor_row(x, y, w, h));
+}
+
+void capture_shader_boundary()
+{
+	rows().push_back("err \"st-unsupported shader no-ir（语义边界，真执行不抑制）\"");
 }
 
 // ------------------------------------------------------------------
@@ -600,9 +646,24 @@ static void lookup_asset_size(love::uint32 id, int &w, int &h)
 	}
 }
 
+int fr_asset_kind_of(love::uint32 id)
+{
+	for (const FrAsset &a : assets())
+		if (a.id == id)
+			return a.kind;
+	return 0;
+}
+
 // 单行执行：.fr 行 = 空格分隔 token，首 token 为 op 名（golden/l0_session.fr
 // 同构）。tee₂（capture_replay）与拓扑 B 离线回放共用本入口——同一物化器、
 // 同一真渲染路径（B4-2 验收线第二分句的同构关键）。
+// B8 T3：回放会话基线——rt 0 的"屏幕"在回放语境 = 会话起点目标。两个回放
+// 驱动（capture_replay / 拓扑 B 离线循环）进出配对设置/清零；循环外零效。
+// RenderTargets 持裸指针：基线画布由调用方（Lua 验证帧/离线局部）保活，
+// 生命周期覆盖回放循环（单线程，无悬挂窗口）。
+static love::graphics::Graphics::RenderTargets g_replay_baseline;
+static bool g_replay_baseline_canvas = false;
+
 void capture_exec_row(love::graphics::Graphics *gfx, const std::string &row)
 {
 	if (gfx == nullptr)
@@ -868,6 +929,52 @@ void capture_exec_row(love::graphics::Graphics *gfx, const std::string &row)
 			}
 		}
 	}
+	else if (row.compare(0, 3, "rt ") == 0)
+	{
+		// B8 T3：目标切换（0=屏幕）。回放侧：真 Canvas 由物化器建。
+		// rt 0 的"屏幕"在回放语境 = 会话基线目标（present 真屏幕 / tee₂
+		// 验证 Canvas / 拓扑 B 离线 Canvas）——盲切默认缓冲会把基线画布
+		// 上的帧内容劫持到真屏幕（B8 T3 实测教训）。
+		unsigned target = 0;
+		if (sscanf(row.c_str(), "rt %u", &target) == 1)
+		{
+			if (target == 0)
+			{
+				if (g_replay_baseline_canvas)
+					gfx->setCanvas(g_replay_baseline);
+				else
+					gfx->setCanvas();
+				return;
+			}
+			love::graphics::Canvas *cv = fr_materialize_canvas(gfx, target);
+			if (cv != nullptr)
+			{
+				love::graphics::Graphics::RenderTarget rtArg(cv);
+				gfx->setCanvas(rtArg, 0);
+			}
+			else
+				std::fprintf(stderr, "fr: rt %u 物化失败，跳过目标切换\n", target);
+		}
+	}
+	else if (row.compare(0, 8, "scissor ") == 0)
+	{
+		float x = 0, y = 0, w = 0, h = 0;
+		if (sscanf(row.c_str(), "scissor %f %f %f %f", &x, &y, &w, &h) == 4)
+		{
+			if (x < 0 || y < 0) // -1 哨兵 = off
+				gfx->setScissor();
+			else
+			{
+				love::Rect r;
+				r.x = (int) x; r.y = (int) y; r.w = (int) w; r.h = (int) h;
+				gfx->setScissor(r);
+			}
+		}
+	}
+	else if (row.compare(0, 4, "err ") == 0)
+	{
+		// err 行（Shader 边界等）：执行侧 no-op（登记性行，回放不消费）。
+	}
 }
 
 void capture_replay(love::graphics::Graphics *gfx)
@@ -875,8 +982,18 @@ void capture_replay(love::graphics::Graphics *gfx)
 	if (gfx == nullptr)
 		return;
 
+	love::graphics::Graphics::RenderTargets saved = gfx->getCanvas();
+	g_replay_baseline = saved;
+	g_replay_baseline_canvas = !saved.colors.empty();
 	for (const std::string &row : rows())
 		capture_exec_row(gfx, row);
+	// 收尾回基线：rt 3 中途留在物化 Canvas 的帧也归位（基线=屏幕时与
+	// setCanvas() 同义；present 钩路径天然如此）。
+	if (g_replay_baseline_canvas)
+		gfx->setCanvas(saved);
+	else
+		gfx->setCanvas();
+	g_replay_baseline_canvas = false;
 }
 
 // ------------------------------------------------------------------
@@ -907,6 +1024,20 @@ static int push_string_array(lua_State *L, const std::vector<std::string> &rs)
 int w_frTakeSession(lua_State *L)
 {
 	return push_string_array(L, rows());
+}
+
+// B8 T3：观察侧围栏出口（demo 验证帧 rig 机器行不进内核流；配对调用，
+// 计数嵌套安全，越界 resume 为 no-op）。
+int w_frCaptureSuspend(lua_State *L)
+{
+	capture_suspend();
+	return 0;
+}
+
+int w_frCaptureResume(lua_State *L)
+{
+	capture_resume();
+	return 0;
 }
 
 int w_frTakeAssets(lua_State *L)
@@ -1125,7 +1256,8 @@ static int offline_parse_text(const std::string &buf, OfflineSession &s)
 		    || ln.compare(0, 6, "print ") == 0 || ln.compare(0, 5, "rect ") == 0
 		    || ln.compare(0, 5, "line ") == 0 || ln.compare(0, 7, "circle ") == 0
 		    || ln.compare(0, 5, "poly ") == 0 || ln.compare(0, 4, "arc ") == 0
-		    || ln.compare(0, 7, "points ") == 0)
+		    || ln.compare(0, 7, "points ") == 0
+		    || ln.compare(0, 3, "rt ") == 0 || ln.compare(0, 8, "scissor ") == 0)
 		{
 			s.frames.back().push_back(ln);
 			continue;
@@ -1354,6 +1486,19 @@ static int offline_parse_frame_body(const love::uint8 *body, size_t n, size_t ba
 			out_rows.push_back(row);
 			break;
 		}
+		case FR_OP_RT: // B8 T3：rt target u32（0=会话基线，见 capture_exec_row）
+		{
+			love::uint32 target = fr_dec_u32(&d);
+			out_rows.push_back(render_rt_row(target));
+			break;
+		}
+		case FR_OP_SCISSOR: // B8 T3：scissor x y w h（-1 哨兵=off）
+		{
+			float x = fr_dec_f32(&d), y = fr_dec_f32(&d);
+			float w = fr_dec_f32(&d), h = fr_dec_f32(&d);
+			out_rows.push_back(render_scissor_row(x, y, w, h));
+			break;
+		}
 		default:
 			std::fprintf(stderr, "fr-offline: off %d：离线回放不支持的非 out 行 "
 			             "opcode 0x%02X（B8 op 域）\n", (int) (base + d.off - 1), d.op);
@@ -1502,8 +1647,11 @@ int fr_offline_replay(const char *path, love::graphics::Graphics *gfx)
 			love::graphics::Graphics::RenderTargets rts;
 			rts.colors.emplace_back(canvas, 0);
 			gfx->setCanvas(rts);
+			g_replay_baseline = rts;      // B8 T3：离线画布即会话基线（rt 0 归位）
+			g_replay_baseline_canvas = true;
 			for (const std::string &row : s.frames[fi])
 				capture_exec_row(gfx, row);
+			g_replay_baseline_canvas = false;
 			gfx->setCanvas(); // 解绑后再回读（active Canvas 不许 newImageData）
 
 			love::Rect rect = {0, 0, canvas->getPixelWidth(), canvas->getPixelHeight()};

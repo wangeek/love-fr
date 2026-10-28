@@ -264,6 +264,7 @@ local function register_assets()
 	img_data:mapPixel(function() return 1, 0, 0, 1 end) -- 全红
 	FR_ASSETS[1] = love.graphics.newImage(img_data)
 	FR_ASSETS[2] = love.graphics.newFont(14)
+	FR_ASSETS[3] = love.graphics.newCanvas(256, 256)  -- B8 T3：canvas 代理（rt 行验收）
 end
 
 function ir_graphics.draw(tex, quad, x, y, rot, sx, sy, ox, oy, r, g, b, a)
@@ -307,10 +308,16 @@ local function verify_frame()
 	-- 真 Canvas 开关无关（语义替代版不建真 Canvas，见 fr_capture.h 边界）；
 	-- _frNewCanvasReal 定 dpiScale=1（像素域=逻辑域）。
 	local c = love.graphics._frNewCanvasReal(640, 480)
+	-- B8 T3：观察侧围栏——rig 的真 Canvas 切换是观察机器，不进内核会话流
+	--（否则 err/rt 机器行混入帧 delta；多 VM 原则：观察机器不进被观测流）。
+	love.graphics._frCaptureSuspend()
 	love.graphics.setCanvas(c)
+	love.graphics._frCaptureResume()
 	love.draw()                 -- 捕获模式：记录行（真执行被抑制）；关闭模式：真画
 	love.graphics._frReplay()   -- 捕获模式：行缓冲回放到 canvas；关闭模式：空缓冲 no-op
+	love.graphics._frCaptureSuspend()
 	love.graphics.setCanvas()   -- 先解绑：active Canvas 不许 newImageData（11.5 实测报错）
+	love.graphics._frCaptureResume()
 	love.graphics._frCanvasProbe(c, frame)
 	-- 会话行（测试判据）：资产行 + out 段行（clear/draw/print/rect）。
 	-- tee 模式不在此打印/退出：验证帧捕获行归本帧 delta，会话末统一组装写

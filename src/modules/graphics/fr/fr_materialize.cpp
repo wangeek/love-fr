@@ -78,6 +78,12 @@ static std::map<love::uint32, love::StrongRef<love::graphics::Font>> &font_cache
 	return m;
 }
 
+static std::map<love::uint32, love::StrongRef<love::graphics::Canvas>> &canvas_cache()
+{
+	static std::map<love::uint32, love::StrongRef<love::graphics::Canvas>> m;
+	return m;
+}
+
 // stderr 告警按 id 一次性（行缓冲全会话累积、present 每帧重放——不收口会刷屏）。
 static void warn_once(love::uint32 id, const char *why)
 {
@@ -248,6 +254,40 @@ love::graphics::Font *fr_materialize_font(love::graphics::Graphics *gfx, love::u
 
 	font_cache()[id] = love::StrongRef<love::graphics::Font>(font, love::Acquire::NORETAIN);
 	return font;
+}
+
+love::graphics::Canvas *fr_materialize_canvas(love::graphics::Graphics *gfx, love::uint32 id)
+{
+	FrAssetInfo info;
+	if (!fr_lookup_asset(id, info) || info.kind != FR_ASSET_CANVAS)
+	{
+		warn_once(id, "非 canvas 资产");
+		return nullptr;
+	}
+
+	auto it = canvas_cache().find(id);
+	if (it != canvas_cache().end())
+		return it->second.get();
+
+	love::graphics::Canvas::Settings settings;
+	settings.width = info.w;
+	settings.height = info.h;
+	settings.dpiScale = 1.0f; // 像素域=逻辑域（_frNewCanvasReal 同口径）
+
+	love::graphics::Canvas *canvas = nullptr;
+	try
+	{
+		canvas = gfx->newCanvas(settings);
+	}
+	catch (love::Exception &)
+	{
+		warn_once(id, "newCanvas 抛异常");
+		return nullptr;
+	}
+
+	canvas_cache()[id] =
+		love::StrongRef<love::graphics::Canvas>(canvas, love::Acquire::NORETAIN);
+	return canvas;
 }
 
 } // fr

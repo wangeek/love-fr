@@ -55,6 +55,18 @@ function kernel.draw(g, assets)
 		love.graphics.setColor(0, 1, 1, 1)          -- 青
 		love.graphics.arc("fill", "pie", 300.0, 200.0, 25.0, 0.0, 1.570796, 16)
 		love.graphics.setColor(1, 1, 1, 1)          -- 复位
+
+		-- B8 T3 rt/scissor（canvas 代理 id=3 由 main.lua 注册）
+		if assets[3] then
+			love.graphics.setCanvas(assets[3])      -- canvas 代理 → rt 3
+			love.graphics.clear(0, 0, 1, 1)         -- 蓝底（画进 canvas）
+			love.graphics.setCanvas()               -- 复位 → rt 0
+			love.graphics.setScissor(100, 200, 300, 150)
+			love.graphics.setColor(1, 0, 1, 1)      -- 品红（受 scissor 裁剪）
+			love.graphics.rectangle("fill", 50, 150, 200, 200)
+			love.graphics.setScissor()              -- off 哨兵
+			love.graphics.setColor(1, 1, 1, 1)      -- 复位
+		end
 	end
 end
 
