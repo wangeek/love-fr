@@ -146,6 +146,9 @@ static std::vector<std::string> &err_rows()
 	return r;
 }
 
+// B11 实测防线（定义见 capture_rt 前的完整版）：out 行统一入口。
+static void push_out_row(const std::string &row);
+
 bool capture_enabled()
 {
 	static const bool enabled = []()
@@ -446,14 +449,14 @@ void capture_clear(const love::graphics::OptionalColorf &color,
 	if (c == nullptr)
 		return; // 无颜色 clear（clear(false)/纯 stencil/depth）本批不产行
 
-	rows().push_back(render_clear_row(rgba8(c->value.r), rgba8(c->value.g),
+	push_out_row(render_clear_row(rgba8(c->value.r), rgba8(c->value.g),
 	                                  rgba8(c->value.b), rgba8(c->value.a)));
 }
 
 void capture_draw(love::uint32 texid, love::uint32 quadid, float x, float y, float rot,
                   float sx, float sy, float ox, float oy, const love::Colorf &color)
 {
-	rows().push_back(render_draw_row(texid, quadid, x, y, rot, sx, sy, ox, oy,
+	push_out_row(render_draw_row(texid, quadid, x, y, rot, sx, sy, ox, oy,
 	                                 rgba8(color.r), rgba8(color.g),
 	                                 rgba8(color.b), rgba8(color.a)));
 }
@@ -461,7 +464,7 @@ void capture_draw(love::uint32 texid, love::uint32 quadid, float x, float y, flo
 void capture_print(love::uint32 fontid, const std::string &text, float x, float y,
                    float rot, float sx, float sy, const love::Colorf &color)
 {
-	rows().push_back(render_print_row(fontid, text, x, y, rot, sx, sy,
+	push_out_row(render_print_row(fontid, text, x, y, rot, sx, sy,
 	                                  rgba8(color.r), rgba8(color.g),
 	                                  rgba8(color.b), rgba8(color.a)));
 }
@@ -469,7 +472,7 @@ void capture_print(love::uint32 fontid, const std::string &text, float x, float 
 void capture_rect(love::uint8 mode, float x, float y, float w, float h, float rx,
                   float ry, float width, const love::Colorf &color)
 {
-	rows().push_back(render_rect_row(mode, x, y, w, h, rx, ry, width,
+	push_out_row(render_rect_row(mode, x, y, w, h, rx, ry, width,
 	                                 rgba8(color.r), rgba8(color.g),
 	                                 rgba8(color.b), rgba8(color.a)));
 }
@@ -497,7 +500,7 @@ void capture_line(const float *pts, love::uint32 n, float width, const love::Col
 		+ " " + fmt_f(width)
 		+ " " + std::to_string(rgba8(color.r)) + " " + std::to_string(rgba8(color.g))
 		+ " " + std::to_string(rgba8(color.b)) + " " + std::to_string(rgba8(color.a));
-	rows().push_back(row);
+	push_out_row(row);
 }
 
 void capture_circle(love::uint8 mode, float x, float y, float r, love::uint32 seg,
@@ -507,7 +510,7 @@ void capture_circle(love::uint8 mode, float x, float y, float r, love::uint32 se
 	snprintf(buf, sizeof(buf), "circle %u %s %s %s %u %d %d %d %d",
 	         (unsigned) mode, fmt_f(x).c_str(), fmt_f(y).c_str(), fmt_f(r).c_str(),
 	         (unsigned) seg, rgba8(color.r), rgba8(color.g), rgba8(color.b), rgba8(color.a));
-	rows().push_back(buf);
+	push_out_row(buf);
 }
 
 void capture_poly(love::uint8 mode, const float *pts, love::uint32 n,
@@ -516,7 +519,7 @@ void capture_poly(love::uint8 mode, const float *pts, love::uint32 n,
 	std::string row = "poly " + std::to_string((unsigned) mode) + " " + render_pts(pts, n)
 		+ " " + std::to_string(rgba8(color.r)) + " " + std::to_string(rgba8(color.g))
 		+ " " + std::to_string(rgba8(color.b)) + " " + std::to_string(rgba8(color.a));
-	rows().push_back(row);
+	push_out_row(row);
 }
 
 void capture_arc(love::uint8 mode, love::uint8 arctype, float x, float y, float r,
@@ -528,7 +531,7 @@ void capture_arc(love::uint8 mode, love::uint8 arctype, float x, float y, float 
 	         fmt_f(x).c_str(), fmt_f(y).c_str(), fmt_f(r).c_str(),
 	         fmt_f(a1).c_str(), fmt_f(a2).c_str(), (unsigned) seg,
 	         rgba8(color.r), rgba8(color.g), rgba8(color.b), rgba8(color.a));
-	rows().push_back(buf);
+	push_out_row(buf);
 }
 
 void capture_points(const float *pts, love::uint32 n, float size, const love::Colorf &color)
@@ -537,17 +540,41 @@ void capture_points(const float *pts, love::uint32 n, float size, const love::Co
 		+ " " + fmt_f(size)
 		+ " " + std::to_string(rgba8(color.r)) + " " + std::to_string(rgba8(color.g))
 		+ " " + std::to_string(rgba8(color.b)) + " " + std::to_string(rgba8(color.a));
+	push_out_row(row);
+}
+
+// B11 实测防线：rows() 的统一入口——NaN/Inf 参数（真实游戏除零/未初始化
+// 参数会流进来，240 帧流实测 5008 行 -nan(ind)/inf）写不进 canonical 文本
+// 域（fr-spec 数值域拒收，fr-as 拒收）。处置 = 转语义边界 err 行 + 该行
+// 跳过（忠实性事实不撒谎：行缺失即渲染缺口，回放端如实可见）。
+static void push_out_row(const std::string &row)
+{
+	if (row.find("nan") != std::string::npos || row.find("inf") != std::string::npos)
+	{
+		static int warned = 0;
+		if (warned < 5)
+		{
+			std::fprintf(stderr, "fr: 行含非有限参数，转 err 登记并跳过：%s\n",
+			             row.substr(0, 60).c_str());
+			warned++;
+		}
+		std::string e = "err \"st-nonfinite-params ";
+		e += row.substr(0, row.find(' '));
+		e += "（捕获参数 NaN/Inf，行跳过）\"";
+		err_rows().push_back(e);
+		return;
+	}
 	rows().push_back(row);
 }
 
 void capture_rt(love::uint32 target)
 {
-	rows().push_back(render_rt_row(target));
+	push_out_row(render_rt_row(target));
 }
 
 void capture_scissor(float x, float y, float w, float h)
 {
-	rows().push_back(render_scissor_row(x, y, w, h));
+	push_out_row(render_scissor_row(x, y, w, h));
 }
 
 void capture_shader_boundary()
@@ -1038,19 +1065,33 @@ int w_frNewImage(lua_State *L)
 
 	if (lua_type(L, 1) == LUA_TSTRING)
 	{
-		// 文件路径：读真实字节登记。宽高 demo 期无真解码登记 0（占位渲染
-		// 不可见；真解码归后续批次——hex 是编码后文件字节，非像素域）。
+		// 文件路径：读真实字节 → image 模块 CPU 解码（B11 实测修复——此前
+		// 登记编码字节且 w/h=0，代理 getWidth()=0 → 游戏侧除零（cvw/w0）
+		// → inf/NaN 流进变换矩阵，240 帧流实测 5008 行 nan/inf）。登记归一
+		// 到 RGBA8 像素口径（协议约定，与 ImageData 形态同源；物化端自动通）。
 		const char *filename = luaL_checkstring(L, 1);
 		love::filesystem::Filesystem *fs =
 			love::Module::getInstance<love::filesystem::Filesystem>(love::Module::M_FILESYSTEM);
 		if (fs == nullptr)
 			return luaL_error(L, "fr.newImage: filesystem 未初始化");
+		love::image::Image *imagemod =
+			love::Module::getInstance<love::image::Image>(love::Module::M_IMAGE);
+		if (imagemod == nullptr)
+			return luaL_error(L, "fr.newImage: image 模块未初始化");
 
 		love::filesystem::FileData *data = nullptr;
 		love::luax_catchexcept(L, [&]() { data = fs->read(filename); });
 
-		a.data_hex = hex_encode(data->getData(), data->getSize());
+		love::image::ImageData *imgd = nullptr;
+		love::luax_catchexcept(L, [&]() { imgd = imagemod->newImageData(data); });
 		data->release();
+		if (imgd == nullptr)
+			return luaL_error(L, "fr.newImage: 解码失败（非图像文件？）");
+
+		a.w = imgd->getWidth();
+		a.h = imgd->getHeight();
+		a.data_hex = hex_encode(imgd->getData(), imgd->getSize());
+		imgd->release();
 	}
 	else
 	{
