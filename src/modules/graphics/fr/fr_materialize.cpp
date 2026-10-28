@@ -134,11 +134,6 @@ love::graphics::Image *fr_materialize_image(love::graphics::Graphics *gfx, love:
 	}
 
 	std::vector<love::uint8> bytes = unhex(info.data_hex);
-	if (bytes.size() != (size_t) info.w * info.h * 4)
-	{
-		warn_once(id, "hex 长度 ≠ w*h*4（RGBA8 域）");
-		return nullptr;
-	}
 
 	love::image::Image *im =
 		love::Module::getInstance<love::image::Image>(love::Module::M_IMAGE);
@@ -149,14 +144,54 @@ love::graphics::Image *fr_materialize_image(love::graphics::Graphics *gfx, love:
 	}
 
 	love::image::ImageData *d = nullptr;
-	try
+	// B12 瘦身修订：登记字节两口径——魔数命中（PNG/BMP/JPEG）= 编码文件
+	// 字节，FileData 承载走 newImageData(Data) 解码（登记侧不再膨胀成
+	// RGBA8 像素域，路径资产 5-10×）；否则 = RGBA8 原始像素（ImageData
+	// 形态登记），直构并做 w*h*4 长度校验。
+	static const love::uint8 kPng[4] = {0x89, 0x50, 0x4E, 0x47};
+	static const love::uint8 kBmp[2] = {0x42, 0x4D};
+	static const love::uint8 kJpg[2] = {0xFF, 0xD8};
+	bool encoded = bytes.size() >= 4
+	               && (std::memcmp(bytes.data(), kPng, 4) == 0
+	                   || std::memcmp(bytes.data(), kBmp, 2) == 0
+	                   || std::memcmp(bytes.data(), kJpg, 2) == 0);
+	if (encoded)
 	{
-		// own=false（缺省）→ 拷贝进 ImageData，bytes 生命周期本函数内即可。
-		d = im->newImageData(info.w, info.h, love::PIXELFORMAT_RGBA8, bytes.data());
+		try
+		{
+			love::filesystem::FileData *fd =
+				new love::filesystem::FileData(bytes.size(), "fr_materialize_image");
+			std::memcpy(fd->getData(), bytes.data(), bytes.size());
+			d = im->newImageData(fd);
+			fd->release();
+		}
+		catch (love::Exception &)
+		{
+			warn_once(id, "编码字节解码抛异常");
+			return nullptr;
+		}
 	}
-	catch (love::Exception &)
+	else
 	{
-		warn_once(id, "newImageData 抛异常");
+		if (bytes.size() != (size_t) info.w * info.h * 4)
+		{
+			warn_once(id, "hex 长度 ≠ w*h*4（RGBA8 域）");
+			return nullptr;
+		}
+		try
+		{
+			// own=false（缺省）→ 拷贝进 ImageData，bytes 生命周期本函数内即可。
+			d = im->newImageData(info.w, info.h, love::PIXELFORMAT_RGBA8, bytes.data());
+		}
+		catch (love::Exception &)
+		{
+			warn_once(id, "newImageData 抛异常");
+			return nullptr;
+		}
+	}
+	if (d == nullptr)
+	{
+		warn_once(id, "解码返回空");
 		return nullptr;
 	}
 

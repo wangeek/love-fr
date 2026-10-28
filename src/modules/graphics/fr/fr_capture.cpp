@@ -1063,35 +1063,58 @@ int w_frNewImage(lua_State *L)
 	FrAsset a;
 	a.kind = FR_ASSET_IMAGE;
 
-	if (lua_type(L, 1) == LUA_TSTRING)
+	if (lua_type(L, 1) == LUA_TSTRING
+	    || love::luax_istype(L, 1, love::filesystem::FileData::type))
 	{
-		// 文件路径：读真实字节 → image 模块 CPU 解码（B11 实测修复——此前
-		// 登记编码字节且 w/h=0，代理 getWidth()=0 → 游戏侧除零（cvw/w0）
-		// → inf/NaN 流进变换矩阵，240 帧流实测 5008 行 nan/inf）。登记归一
-		// 到 RGBA8 像素口径（协议约定，与 ImageData 形态同源；物化端自动通）。
-		const char *filename = luaL_checkstring(L, 1);
-		love::filesystem::Filesystem *fs =
-			love::Module::getInstance<love::filesystem::Filesystem>(love::Module::M_FILESYSTEM);
-		if (fs == nullptr)
-			return luaL_error(L, "fr.newImage: filesystem 未初始化");
+		// 路径/FileData 形态（B12 瘦身修订）：登记**原始编码字节**（PNG 等
+		// 原样，5-10× 小于 RGBA8 像素域），w/h 用 image 模块解码探得后即弃
+		//（解码只为代理几何；B11 修复的除零根因在 w/h=0，字节口径无关）。
+		// 物化端魔数判别先解码后直构（fr_materialize.cpp）。
+		love::filesystem::FileData *data = nullptr;
+		love::filesystem::FileData *owned = nullptr;
+		if (lua_type(L, 1) == LUA_TSTRING)
+		{
+			const char *filename = luaL_checkstring(L, 1);
+			love::filesystem::Filesystem *fs =
+				love::Module::getInstance<love::filesystem::Filesystem>(love::Module::M_FILESYSTEM);
+			if (fs == nullptr)
+				return luaL_error(L, "fr.newImage: filesystem 未初始化");
+			love::luax_catchexcept(L, [&]() { owned = fs->read(filename); });
+			data = owned;
+		}
+		else
+			data = love::luax_checktype<love::filesystem::FileData>(L, 1); // 栈持有
+
 		love::image::Image *imagemod =
 			love::Module::getInstance<love::image::Image>(love::Module::M_IMAGE);
 		if (imagemod == nullptr)
+		{
+			if (owned != nullptr)
+				owned->release();
 			return luaL_error(L, "fr.newImage: image 模块未初始化");
-
-		love::filesystem::FileData *data = nullptr;
-		love::luax_catchexcept(L, [&]() { data = fs->read(filename); });
+		}
 
 		love::image::ImageData *imgd = nullptr;
 		love::luax_catchexcept(L, [&]() { imgd = imagemod->newImageData(data); });
-		data->release();
-		if (imgd == nullptr)
-			return luaL_error(L, "fr.newImage: 解码失败（非图像文件？）");
-
-		a.w = imgd->getWidth();
-		a.h = imgd->getHeight();
-		a.data_hex = hex_encode(imgd->getData(), imgd->getSize());
-		imgd->release();
+		if (imgd != nullptr)
+		{
+			a.w = imgd->getWidth();
+			a.h = imgd->getHeight();
+			imgd->release();
+		}
+		else
+		{
+			static bool warned = false;
+			if (!warned)
+			{
+				std::fprintf(stderr, "fr: newImage 字节解码失败（非图像文件？）"
+				             "——w/h 记 0（游戏侧几何除法仍会暴露）\n");
+				warned = true;
+			}
+		}
+		a.data_hex = hex_encode(data->getData(), data->getSize());
+		if (owned != nullptr)
+			owned->release();
 	}
 	else
 	{

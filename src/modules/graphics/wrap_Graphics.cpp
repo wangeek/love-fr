@@ -200,6 +200,30 @@ int w_present(lua_State *L)
 	// B9 崩溃探针懒装（FR_CRASH_PROBE=1）：SEH 过滤器 + PDB 符号（现场直读）。
 	if (fr::capture_enabled() && getenv("FR_CRASH_PROBE") != nullptr)
 		fr::fr_install_crash_probe();
+	// B12 FR_BOOT_SCRIPT：外置状态根注入（首帧 present、s_crc 采集前惰性
+	// 执行一次）。脚本由录制环境提供（env 指路，**零游戏源码改动**），
+	// 内容例：require 游戏状态模块后调 love.graphics._frStateRoot(根表)
+	//——观测范围从全堆（60MB 级，第三方无注册时的回退）收缩到状态子图
+	//（MB 级）：录制吞吐恢复 + s_crc 升回真判据（子图口径跨进程可比）。
+	// 脚本属观察机器：失败（缺文件/脚本报错）→ stderr + 降级全堆，不崩。
+	static bool s_fr_boot_ran = false;
+	if (fr::capture_enabled() && !s_fr_boot_ran)
+	{
+		s_fr_boot_ran = true;
+		const char *bp = getenv("FR_BOOT_SCRIPT");
+		if (bp != nullptr && bp[0] != '\0')
+		{
+			if (luaL_dofile(L, bp) != LUA_OK)
+			{
+				std::fprintf(stderr, "fr: FR_BOOT_SCRIPT 执行失败（降级全堆）：%s\n",
+				             lua_tostring(L, -1) != nullptr ? lua_tostring(L, -1) : "?");
+				lua_pop(L, 1);
+			}
+			else
+				std::fprintf(stderr, "fr: FR_BOOT_SCRIPT 已执行（%s）\n", bp);
+		}
+	}
+
 	// B9 FR_NO_SCRC=1：跳过堆 CRC/diff（崩溃归属二分探针②）。
 	if (fr::capture_enabled() && getenv("FR_NO_SCRC") == nullptr)
 	{

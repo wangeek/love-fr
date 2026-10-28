@@ -68,10 +68,14 @@ static void try_init(love::graphics::Graphics *gfx)
 		return; // 未启用（静默——常规路径）
 
 	const char *sha = getenv("FR_SHA");
+	static const char *kZeroSha = "0000000000000000000000000000000000000000000000000000000000000000";
 	if (sha == nullptr || !valid_sha(sha))
 	{
-		disable("FR_SHA 缺失或非 64 hex（会话头指纹）");
-		return;
+		// B11 拍板：缺省全 0 兜底（不再停用）——手动冒烟免填；判据对账
+		//（fr-check 验表版本）需要真指纹时由调用方显式给。
+		sha = kZeroSha;
+		std::fprintf(stderr, "fr: FR_SHA 缺失/非法，会话头指纹记 0"
+		             "（判据对账需真指纹时请显式传入）\n");
 	}
 
 	const char *seed = getenv("FR_SEED");
