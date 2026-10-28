@@ -17,6 +17,8 @@
 #include "image/Image.h"
 #include "image/ImageData.h"
 #include "timer/Timer.h"
+
+#include <SDL.h>
 #include "modules/graphics/fr/fr_codec.h"
 
 #include <algorithm>
@@ -1842,6 +1844,12 @@ static int offline_parse_text(const std::string &buf, OfflineSession &s)
 			continue; // 同上：s_crc 是内核堆快照，离线无 kernel 只跳过（B6）
 		if (ln.compare(0, 6, "d_crc ") == 0)
 			continue; // 同上：d_crc 是录制侧 out 行 CRC（B7a），离线执行域只重算 D_CRC，不消费
+		if (ln.compare(0, 3, "ev ") == 0)
+			continue; // B10 C tee 会产 ev 行（in 段事实）——离线无 kernel 不注入，跳过
+		if (ln.compare(0, 4, "err ") == 0)
+			continue; // 同上：捕获期 err 行（log 段语义边界登记）
+		if (ln.compare(0, 3, "st ") == 0)
+			continue; // 同上：full 档 st 物理行
 		if (ln.compare(0, 6, "asset ") == 0)
 		{
 			if (!offline_register_asset_text(ln, no))
@@ -2186,6 +2194,7 @@ int fr_offline_replay(lua_State *L, const char *path, love::graphics::Graphics *
 		const char *v = getenv("FR_PLAY");
 		return v != nullptr && std::string(v) == "1";
 	}();
+	bool g_play_interrupted = false; // 关窗中断（循环层旗标）
 	if (gfx == nullptr)
 	{
 		std::fprintf(stderr, "fr-offline: graphics 模块缺席\n");
@@ -2258,27 +2267,56 @@ int fr_offline_replay(lua_State *L, const char *path, love::graphics::Graphics *
 			g_replay_baseline_canvas = false;
 			gfx->setCanvas(); // 解绑后再回读（active Canvas 不许 newImageData）
 
+			// B11 FR_PLAY：跳过逐帧 GPU→CPU 回读（240 帧 × 全画布 CRC 是
+			// 播放最重开销——判据序列归非播放路径负责，播放只管给人看）。
+			// 中断时跳回读直接续循环收尾。
+			if (g_play_interrupted)
+				continue;
+
 			love::Rect rect = {0, 0, canvas->getPixelWidth(), canvas->getPixelHeight()};
 			love::image::ImageData *img = canvas->newImageData(imagemod, 0, 0, rect);
 
 			// B11 FR_PLAY=1：视觉播放——离线画布贴屏幕（缩放适配窗口）+
 			// 按录制 dt 节奏 sleep + present。默认关（CI 判据路径零 sleep
 			// 零上屏——"持续黑窗"是拓扑 B 无头验证的既定形态，非 bug）。
+			// 主线程长阻塞（每帧秒级）会让 Windows 判窗口 hung（白屏关不
+			// 掉——实测"绝对失去响应"）——每帧泵 SDL 消息 + 响应关窗。
 			if (g_fr_play)
 			{
-				gfx->setCanvas();
-				gfx->origin();
-				float sx = (float) gfx->getWidth() / (float) canvas->getPixelWidth();
-				float sy = (float) gfx->getHeight() / (float) canvas->getPixelHeight();
-				gfx->setColor(love::Colorf(1.0f, 1.0f, 1.0f, 1.0f));
-				love::Matrix4 m(0.0f, 0.0f, 0.0f, sx, sy, 0.0f, 0.0f, 0.0f, 0.0f);
-				gfx->draw((love::graphics::Drawable *) canvas, m);
-				love::timer::Timer *timer =
-					love::Module::getInstance<love::timer::Timer>(love::Module::M_TIMER);
-				double dt = fi < s.dts.size() ? s.dts[fi] : (1.0 / 60.0);
-				if (timer != nullptr)
-					timer->sleep(dt);
-				gfx->present(L);
+				SDL_PumpEvents();
+				SDL_Event e;
+				bool quit = false;
+				while (SDL_PollEvent(&e))
+				{
+					if (e.type == SDL_QUIT)
+						quit = true; // 关窗/系统关机：中断播放（干净退出）
+				}
+				if (quit)
+				{
+					std::fprintf(stderr, "fr-play: 用户关窗，播至第 %d/%d 帧\n",
+					             (int) fi, (int) s.frames.size());
+					g_play_interrupted = true;
+				}
+				else
+				{
+					gfx->setCanvas();
+					gfx->origin();
+					float sx = (float) gfx->getWidth() / (float) canvas->getPixelWidth();
+					float sy = (float) gfx->getHeight() / (float) canvas->getPixelHeight();
+					gfx->setColor(love::Colorf(1.0f, 1.0f, 1.0f, 1.0f));
+					love::Matrix4 m(0.0f, 0.0f, 0.0f, sx, sy, 0.0f, 0.0f, 0.0f, 0.0f);
+					gfx->draw((love::graphics::Drawable *) canvas, m);
+					love::timer::Timer *timer =
+						love::Module::getInstance<love::timer::Timer>(love::Module::M_TIMER);
+					double dt = fi < s.dts.size() ? s.dts[fi] : (1.0 / 60.0);
+					// 节奏下限 1/60：捕获态 step 真值可能极小（快进段），照播
+					// 瞬闪不可看——播放是给人看的，判据节奏不受影响。
+					if (dt < 1.0 / 60.0)
+						dt = 1.0 / 60.0;
+					if (timer != nullptr)
+						timer->sleep(dt);
+					gfx->present(L);
+				}
 			}
 
 			// D_CRC n = 前 n 个帧块执行后的画布 CRC（live 验证帧计数同口径：
