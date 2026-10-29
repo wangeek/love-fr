@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -247,6 +248,57 @@ void fr_session_frame(love::graphics::Graphics *gfx)
 				             (unsigned long long) pos, esc.c_str());
 				rows.insert(rows.begin() + pos, line);
 			};
+			// pd 检测（B15 尾巴优化）：同身份行（首两 token 同=op+资产对）且
+			// 恰一个数值 token 差 → pd 替代 rdp+rdm 对（单参绝对值行更短）。
+			// 逐块替换处理：变更块内逐位配对（局部对位——回合制动画的行序
+			// 稳定使然），配不上的位退回 rdp/rdm。
+			auto try_pd = [&](const std::string &ref_line,
+			                  const std::string &cur_line) -> bool
+			{
+				if (ref_line.compare(0, 5, "draw ") != 0)
+					return false; // pd 白名单=draw 参数（rect 无资产身份）
+				// token 化比差
+				std::vector<std::string> rt, ct;
+				{
+					std::istringstream iss_r(ref_line), iss_c(cur_line);
+					std::string t;
+					while (iss_r >> t) rt.push_back(t);
+					while (iss_c >> t) ct.push_back(t);
+				}
+				if (rt.size() != ct.size() || rt.size() < 3 || rt[0] != ct[0]
+				    || rt[1] != ct[1])
+					return false; // 长度变/op 变/资产对变 → 非 pd
+				int diff = -1;
+				for (size_t i = 2; i < rt.size(); i++)
+					if (rt[i] != ct[i])
+					{
+						if (diff >= 0) return false; // 多 token 差
+						diff = (int) i;
+					}
+				if (diff < 0) return false; // 全同（不该到这）
+				// token 位 → 参数名（draw 签名序：tex quad x y rot sx sy ox oy r g b a）
+				static const char *kNames[] = {"", "", "x", "y", "rot", "sx", "sy",
+				                               "ox", "oy", "", "", "", ""};
+				if (diff >= 2 && diff <= 9 && kNames[diff][0] != '\0')
+				{
+					unsigned asset = (unsigned) strtoul(ct[1].c_str(), nullptr, 10);
+					// k = 帧内引用序（cur[0..b) 中该 asset 的出现数——workpiece
+					// 前缀镜像 cur，直接数 cur 前缀）
+					unsigned k = 0;
+					for (size_t i = 0; i < b; i++)
+					{
+						unsigned ta = 0, qa = 0;
+						if (sscanf(cur_rows[i].c_str(), "draw %u %u", &ta, &qa) == 2
+						    && ta == asset)
+							k++;
+					}
+					std::fprintf(s_fh, "pd %u %u %s %s\n", asset, k,
+					             kNames[diff], ct[diff].c_str());
+					rows[b] = cur_line; // 就地改写（workpiece 同步）
+					return true;
+				}
+				return false; // 色差（rgb 位）→ rdp 全行（pd 白名单外）
+			};
 			while (a < s_ref_rows.size() || b < cur_rows.size())
 			{
 				if (a < s_ref_rows.size() && b < cur_rows.size()
@@ -257,8 +309,26 @@ void fr_session_frame(love::graphics::Graphics *gfx)
 				       && s_ref_rows[la] != cur_rows[lb] && skip < 64) { la++; lb++; skip++; }
 				if (!(skip < 64 && la < s_ref_rows.size() && lb < cur_rows.size()))
 				{ la = s_ref_rows.size(); lb = cur_rows.size(); } // 尾块
-				for (size_t i = 0; i < la - a; i++) emit_del(b);          // 全删于 b
-				for (size_t i = 0; i < lb - b; i++) emit_ins(b + i, cur_rows[b + i]);
+				// pd 先试：块内逐位配对（等长块的同位行）
+				size_t na = a, nb = b;
+				bool used_pd = false;
+				if (la - a == lb - b)
+				{
+					while (na < la && nb < lb)
+					{
+						if (try_pd(s_ref_rows[na], cur_rows[nb]))
+						{
+							na++; nb++; a++; b++; used_pd = true;
+							continue;
+						}
+						break; // 首位配不上 → 整块退回编辑脚本（保 pos 不变式）
+					}
+				}
+				if (used_pd && na == la && nb == lb)
+					continue; // 整块 pd 化完成
+				// 退回/剩余：编辑脚本（pd 已消费的游标已同步；剩余按块处理）
+				for (size_t i = 0; i < la - a; i++) { emit_del(b); a++; }
+				for (size_t i = 0; i < lb - b; i++) { emit_ins(b, cur_rows[b]); b++; }
 				a = la; b = lb;
 			}
 			s_ref_rows = cur_rows;
