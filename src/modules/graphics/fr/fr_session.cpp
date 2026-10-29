@@ -236,8 +236,15 @@ void fr_session_frame(love::graphics::Graphics *gfx)
 			};
 			auto emit_ins = [&](size_t pos, const std::string &line)
 			{
+				// 嵌套引号转义（print 行文本域含 " → \"）——解析端对称反转义
+				std::string esc;
+				for (char c : line)
+				{
+					if (c == '"' || c == '\\') esc += '\\';
+					esc += c;
+				}
 				std::fprintf(s_fh, "rdp %llu \"%s\"\n",
-				             (unsigned long long) pos, line.c_str());
+				             (unsigned long long) pos, esc.c_str());
 				rows.insert(rows.begin() + pos, line);
 			};
 			while (a < s_ref_rows.size() || b < cur_rows.size())

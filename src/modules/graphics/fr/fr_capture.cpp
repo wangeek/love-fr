@@ -1953,10 +1953,33 @@ static bool expand_delta_frame(OfflineSession &s, size_t idx,
 		if (d.compare(0, 4, "rdp ") == 0)
 		{
 			unsigned pos = 0;
-			char line[512] = {0};
-			if (sscanf(d.c_str(), "rdp %u \"%511[^\"]\"", &pos, line) != 2 || pos > rows.size())
+			// 手工扫描引号内转义（嵌套引号：print 行文本域含 \"）——
+			// sscanf %[^\"] 会在转义引号处截断，不能用。
+			const char *p0 = d.c_str() + 4;
+			char *endp = nullptr;
+			pos = (unsigned) strtoul(p0, &endp, 10);
+			if (endp == p0 || *endp != ' ' || endp[1] != '"')
 			{
-				std::fprintf(stderr, "fr-offline: 第 %d 行：rdp 解析/越界（%s）\n", no, d.c_str());
+				std::fprintf(stderr, "fr-offline: 第 %d 行：rdp 解析失败（%s）\n", no, d.c_str());
+				return false;
+			}
+			const char *q = endp + 2;
+			std::string line;
+			while (*q != '\0')
+			{
+				if (*q == '\\' && (q[1] == '"' || q[1] == '\\'))
+				{
+					line += q[1];
+					q += 2;
+					continue;
+				}
+				if (*q == '"')
+					break;
+				line += *q++;
+			}
+			if (*q != '"' || pos > rows.size())
+			{
+				std::fprintf(stderr, "fr-offline: 第 %d 行：rdp 未闭合/越界（%s）\n", no, d.c_str());
 				return false;
 			}
 			// 内嵌行 :px denorm（短名→全名，exec 层统一口径）
