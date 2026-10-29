@@ -34,6 +34,12 @@ static size_t c_sdiff_frame = 0; // sdiffs 是帧数组——按帧号索引
 static double s_fallback_dt = 0.016667;
 static bool s_dt_warned = false;
 
+// B15 P1 增量编码状态
+static bool s_delta = false;        // FR_DELTA=1
+static love::uint64 s_delta_i = 32; // FR_DELTA_I（0=无限周期，仅 ev 强制 I）
+static std::vector<std::string> s_ref_rows; // 上一个 I/写帧的行集（S/pd 基线）
+static love::uint64 s_ref_frame = 0;        // S 引用的帧号
+
 static void disable(const char *why)
 {
 	std::fprintf(stderr, "fr: FR_OUT 会话写出停用：%s\n", why);
@@ -100,6 +106,15 @@ static void try_init(love::graphics::Graphics *gfx)
 	s_full = getenv("FR_LOGLEVEL") != nullptr
 	         && std::string(getenv("FR_LOGLEVEL")) == "full";
 
+	// B15 P1：FR_DELTA=1 → 增量写出（head 标 +d，能力协商位）
+	s_delta = getenv("FR_DELTA") != nullptr
+	          && std::string(getenv("FR_DELTA")) == "1";
+	if (const char *di = getenv("FR_DELTA_I"))
+	{
+		long v = strtol(di, nullptr, 10);
+		if (v >= 0) s_delta_i = (love::uint64) v;
+	}
+
 	s_fh = std::fopen(out, "wb"); // canonical LF（"wb" 防 CRT 文本模式改写）
 	if (s_fh == nullptr)
 	{
@@ -110,8 +125,8 @@ static void try_init(love::graphics::Graphics *gfx)
 	// 会话头（demo write_session 同构；几何 = 当前逻辑窗口尺寸）
 	int w = gfx != nullptr ? gfx->getWidth() : 640;
 	int h = gfx != nullptr ? gfx->getHeight() : 480;
-	std::fprintf(s_fh, "frb1 %d %d %s %s %ld\n", w, h, sha,
-	             s_full ? "full" : "base", seedv);
+	std::fprintf(s_fh, "frb1 %d %d %s %s %ld%s\n", w, h, sha,
+	             s_full ? "full" : "base", seedv, s_delta ? " +d" : "");
 	std::fprintf(s_fh, "cmnt fr fork c-tee session\n");
 }
 
@@ -155,8 +170,10 @@ void fr_session_frame(love::graphics::Graphics *gfx)
 
 	// ev 行（in 段）→ err 行（log 段，任何档）→ st 行（log 段，full 档）
 	const std::vector<std::string> &ev = fr_view_ev_rows();
+	size_t ev_start = c_ev;
 	for (; c_ev < ev.size(); c_ev++)
 		std::fprintf(s_fh, "%s\n", ev[c_ev].c_str());
+	bool cur_ev_frame = c_ev > ev_start; // B15：事件帧判定（I 帧强制条件）
 
 	const std::vector<std::string> &err = fr_view_err_rows();
 	for (; c_err < err.size(); c_err++)
@@ -177,12 +194,74 @@ void fr_session_frame(love::graphics::Graphics *gfx)
 	// 空帧 join "" → CRC 0 如实记录）
 	const std::vector<std::string> &out = fr_view_rows();
 	std::string joined;
+	std::vector<std::string> cur_rows;
 	for (; c_out < out.size(); c_out++)
 	{
 		if (!joined.empty())
 			joined += "\n";
 		joined += out[c_out];
-		std::fprintf(s_fh, "%s\n", out[c_out].c_str());
+		cur_rows.push_back(out[c_out]);
+	}
+
+	// B15 P1 增量编码（FR_DELTA=1 门控；head 已标 +d）。事件谓词先验 +
+	// 行集 diff 断言 + I 帧策略（FR_DELTA_I 周期 / ev 帧强制）。
+	bool wrote_same = false; // S 帧旗标（d_crc 语义分层）
+	if (s_delta)
+	{
+		bool ev_frame = cur_ev_frame; // 本帧有 ev 行（已写出的 in 段）
+		if (s_frame_no == 0 || ev_frame || (s_delta_i > 0 && s_frame_no % s_delta_i == 0))
+		{
+			// I 帧：全量行 + ref 基线更新
+			for (const std::string &r : cur_rows)
+				std::fprintf(s_fh, "%s\n", r.c_str());
+			s_ref_rows = cur_rows;
+			s_ref_frame = s_frame_no;
+		}
+		else if (cur_rows == s_ref_rows)
+		{
+			std::fprintf(s_fh, "S %llu\n", (unsigned long long) s_ref_frame);
+			wrote_same = true;
+		}
+		else
+		{
+			// 行级 delta：朴素编辑脚本。**pos 语义 = 操作时刻的当前行序**；
+			// 不变式：workpiece 前缀恒镜像 cur[0..b)——故任意块的操作位 = b
+			//（删除全在 b 重复执行；插入从 b 递增）。LCS 跳同段；pd 优化后续精化。
+			std::vector<std::string> rows = s_ref_rows; // 编辑工作件
+			size_t a = 0, b = 0; // ref 游标 / cur 游标
+			auto emit_del = [&](size_t pos)
+			{
+				std::fprintf(s_fh, "rdm %llu\n", (unsigned long long) pos);
+				rows.erase(rows.begin() + pos);
+			};
+			auto emit_ins = [&](size_t pos, const std::string &line)
+			{
+				std::fprintf(s_fh, "rdp %llu \"%s\"\n",
+				             (unsigned long long) pos, line.c_str());
+				rows.insert(rows.begin() + pos, line);
+			};
+			while (a < s_ref_rows.size() || b < cur_rows.size())
+			{
+				if (a < s_ref_rows.size() && b < cur_rows.size()
+				    && s_ref_rows[a] == cur_rows[b]) { a++; b++; continue; }
+				// 块边界：跳到下一个重合点（短程跳查——行集局部性强；不中=到尾）
+				size_t la = a, lb = b, skip = 0;
+				while (la < s_ref_rows.size() && lb < cur_rows.size()
+				       && s_ref_rows[la] != cur_rows[lb] && skip < 64) { la++; lb++; skip++; }
+				if (!(skip < 64 && la < s_ref_rows.size() && lb < cur_rows.size()))
+				{ la = s_ref_rows.size(); lb = cur_rows.size(); } // 尾块
+				for (size_t i = 0; i < la - a; i++) emit_del(b);          // 全删于 b
+				for (size_t i = 0; i < lb - b; i++) emit_ins(b + i, cur_rows[b + i]);
+				a = la; b = lb;
+			}
+			s_ref_rows = cur_rows;
+			s_ref_frame = s_frame_no;
+		}
+	}
+	else
+	{
+		for (const std::string &r : cur_rows)
+			std::fprintf(s_fh, "%s\n", r.c_str());
 	}
 
 	// end 段：s_crc（present 钩先跑 capture_state_crc——每帧恰一份；缺则
@@ -197,7 +276,19 @@ void fr_session_frame(love::graphics::Graphics *gfx)
 		s_dt_warned = true; // 复用一次性旗标（同为诊断告警）
 	}
 	std::fprintf(s_fh, "s_crc %u\n", (unsigned) scrc);
-	std::fprintf(s_fh, "d_crc %u\n", (unsigned) fr_crc32_bytes(joined.data(), joined.size()));
+	// B15 d_crc 语义分层：增量态 S 帧=锚声明（CRC("same:<ref>")）；其余
+	//（I/delta/全量态）= 解码后行集 CRC（joined 即展开行集——writer 持全量）。
+	if (wrote_same)
+	{
+		std::string decl = "same:" + std::to_string((unsigned long long) s_ref_frame);
+		std::fprintf(s_fh, "d_crc %u\n",
+		             (unsigned) fr_crc32_bytes(decl.data(), decl.size()));
+	}
+	else
+	{
+		std::fprintf(s_fh, "d_crc %u\n",
+		             (unsigned) fr_crc32_bytes(joined.data(), joined.size()));
+	}
 
 	fr_ev_reset_slot(); // 帧内 ev 取号序归零（下一帧从 0 起）
 	s_frame_no++;

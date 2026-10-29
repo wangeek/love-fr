@@ -1891,7 +1891,11 @@ static bool expand_delta_frame(OfflineSession &s, size_t idx,
 {
 	if (idx >= s.frames.size())
 		return false;
-	std::vector<std::string> rows = s.frames[idx]; // 已收的全名行（I 帧基底或空）
+	// 基线：本帧已收集的全名行（I 帧/混合帧）；P1 delta 帧无基例行——
+	// 链式基 = 上一帧展开结果（S 行显式改引用，rdm/rdp 无 S 时用此链）。
+	std::vector<std::string> rows = s.frames[idx];
+	if (rows.empty() && idx > 0)
+		rows = s.frames[idx - 1];
 	for (const std::string &d : delta_rows)
 	{
 		if (d.compare(0, 2, "S ") == 0)
