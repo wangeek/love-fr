@@ -1314,9 +1314,11 @@ void capture_exec_row(love::graphics::Graphics *gfx, const std::string &row)
 		// 回退伪色矩形（伪色按 id 确定性映射）。
 		unsigned tex = 0, quad = 0;
 		float x = 0, y = 0, rot = 0, sx = 0, sy = 0, ox = 0, oy = 0;
-		int r = 0, g = 0, b = 0, a = 255;
-		if (sscanf(row.c_str(), "draw %u %u %f %f %f %f %f %f %f %d %d %d %d",
-		           &tex, &quad, &x, &y, &rot, &sx, &sy, &ox, &oy, &r, &g, &b, &a) == 13)
+		int r = 255, g = 255, b = 255, a = 255;
+		int got = sscanf(row.c_str(), "draw %u %u %f %f %f %f %f %f %f %d %d %d %d",
+		                 &tex, &quad, &x, &y, &rot, &sx, &sy, &ox, &oy, &r, &g, &b, &a);
+		// B14 :px 尾部省略形：7 参（至 sy）→ ox/oy/color 回填默认（0/0/白）。
+		if (got == 7 || got == 13)
 		{
 			// B9 canvas 合成：draw 引用 canvas 资产（fog/minimap 贴回屏幕）
 			//——物化为回放目标 Canvas（与 rt 行同一缓存：rt 段画进去、这里
@@ -1963,14 +1965,34 @@ static int offline_parse_text(const std::string &buf, OfflineSession &s)
 			}
 			continue;
 		}
+		// B14 :px 短名行收容 + 行首规范化（短名→全名 rewrite，exec 分发层
+		//零改动；量化数值 sscanf %f 天然兼容整数形态）。省略尾由 exec 的
+		//draw 分支按返回值回填（px 档唯一省略 op）。
+		auto denorm_px = [&ln](void) -> std::string {
+			static const struct { const char *s, *l; } k[] = {
+				{"D ", "draw "}, {"R ", "rect "}, {"C ", "clear "}, {"PR ", "print "},
+				{"LN ", "line "}, {"CI ", "circle "}, {"PY ", "poly "}, {"AR ", "arc "},
+				{"PT ", "points "}, {"SC ", "scissor "},
+			};
+			for (auto &m : k)
+				if (ln.compare(0, std::strlen(m.s), m.s) == 0)
+					return std::string(m.l) + ln.substr(std::strlen(m.s));
+			return ln;
+		};
 		if (ln.compare(0, 6, "clear ") == 0 || ln.compare(0, 5, "draw ") == 0
 		    || ln.compare(0, 6, "print ") == 0 || ln.compare(0, 5, "rect ") == 0
 		    || ln.compare(0, 5, "line ") == 0 || ln.compare(0, 7, "circle ") == 0
 		    || ln.compare(0, 5, "poly ") == 0 || ln.compare(0, 4, "arc ") == 0
 		    || ln.compare(0, 7, "points ") == 0
-		    || ln.compare(0, 3, "rt ") == 0 || ln.compare(0, 8, "scissor ") == 0)
+		    || ln.compare(0, 3, "rt ") == 0 || ln.compare(0, 8, "scissor ") == 0
+		    // B14 :px 短名（rt 无短名——已 3 字符合规）
+		    || ln.compare(0, 2, "D ") == 0 || ln.compare(0, 2, "R ") == 0
+		    || ln.compare(0, 2, "C ") == 0 || ln.compare(0, 3, "PR ") == 0
+		    || ln.compare(0, 3, "LN ") == 0 || ln.compare(0, 3, "CI ") == 0
+		    || ln.compare(0, 3, "PY ") == 0 || ln.compare(0, 3, "AR ") == 0
+		    || ln.compare(0, 3, "PT ") == 0 || ln.compare(0, 3, "SC ") == 0)
 		{
-			s.frames.back().push_back(ln);
+			s.frames.back().push_back(denorm_px());
 			continue;
 		}
 		std::fprintf(stderr, "fr-offline: 第 %d 行：离线回放不支持的非 out 行（B8 op 域）\n", no);
