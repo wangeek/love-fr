@@ -1876,8 +1876,156 @@ static int offline_register_asset_text(const std::string &row, int lineno)
 	return 0;
 }
 
-// 文本（.fr canonical）→ 会话。结构口径对齐 tools/fr_session.parse_text
-//（行号 1 起报错；行必须位于 frame 块内；帧号连续）。out 行只收本层执行
+// B15 前向声明（定义在本文件后段——denorm_px_line/pd_rewrite_param）
+static std::string denorm_px_line(const std::string &ln);
+static bool pd_rewrite_param(std::string &row, const char *param, float val);
+
+// B15 增量帧展开（C 生产路径——与 capture_exec_row 同地）：对帧 idx 的
+// 增量行序列应用展开，产出全量行集替换 s.frames[idx]。语义与录制端 diff
+// 对称：S=行集取自 ref 帧（dt 独立、不在此处理）；pd=按 (asset,k) 身份
+// 改参（:px denorm 后全名行内替换参数值）；rdp/rdm=帧内行序编辑脚本
+//（pos 递增序应用——编码器产出保证 pos 指向展开中的行集位置）。
+// 返回 false 时已打 stderr（含行号）。
+static bool expand_delta_frame(OfflineSession &s, size_t idx,
+                               const std::vector<std::string> &delta_rows, int no)
+{
+	if (idx >= s.frames.size())
+		return false;
+	std::vector<std::string> rows = s.frames[idx]; // 已收的全名行（I 帧基底或空）
+	for (const std::string &d : delta_rows)
+	{
+		if (d.compare(0, 2, "S ") == 0)
+		{
+			unsigned ref = 0;
+			if (sscanf(d.c_str(), "S %u", &ref) != 1 || ref >= s.frames.size() || ref >= idx)
+			{
+				std::fprintf(stderr, "fr-offline: 第 %d 行：S ref 非法（%s）\n", no, d.c_str());
+				return false;
+			}
+			// S 行集语义：本帧 out 行集 = ref 帧 out 行集（引用当前展开态）
+			rows = s.frames[ref];
+			continue;
+		}
+		if (d.compare(0, 3, "pd ") == 0)
+		{
+			unsigned asset = 0, k = 0;
+			char param[8] = {0};
+			float val = 0;
+			if (sscanf(d.c_str(), "pd %u %u %7s %f", &asset, &k, param, &val) != 4)
+			{
+				std::fprintf(stderr, "fr-offline: 第 %d 行：pd 解析失败（%s）\n", no, d.c_str());
+				return false;
+			}
+			// 身份配对：帧内引用序（该 asset 第 k 次出现，0 起）
+			unsigned seen = 0;
+			bool matched = false;
+			for (auto &r : rows)
+			{
+				unsigned ta = 0, qa = 0;
+				char rest[256];
+				if (sscanf(r.c_str(), "draw %u %u %255[^\n]", &ta, &qa, rest) == 3 && ta == asset)
+				{
+					if (seen == k)
+					{
+						// 参数替换（全名行——denorm 已做）：按 op 签名逐字段重写
+						if (!pd_rewrite_param(r, param, val))
+						{
+							std::fprintf(stderr, "fr-offline: 第 %d 行：pd 改写失败（%s）\n", no, r.c_str());
+							return false;
+						}
+						matched = true;
+						break;
+					}
+					seen++;
+				}
+			}
+			if (!matched)
+			{
+				std::fprintf(stderr, "fr-offline: 第 %d 行：pd 身份 (%u,%u) 未配对\n", no, asset, k);
+				return false;
+			}
+			continue;
+		}
+		if (d.compare(0, 4, "rdp ") == 0)
+		{
+			unsigned pos = 0;
+			char line[512] = {0};
+			if (sscanf(d.c_str(), "rdp %u \"%511[^\"]\"", &pos, line) != 2 || pos > rows.size())
+			{
+				std::fprintf(stderr, "fr-offline: 第 %d 行：rdp 解析/越界（%s）\n", no, d.c_str());
+				return false;
+			}
+			// 内嵌行 :px denorm（短名→全名，exec 层统一口径）
+			std::string full = denorm_px_line(line);
+			rows.insert(rows.begin() + pos, full);
+			continue;
+		}
+		if (d.compare(0, 4, "rdm ") == 0)
+		{
+			unsigned pos = 0;
+			if (sscanf(d.c_str(), "rdm %u", &pos) != 1 || pos >= rows.size())
+			{
+				std::fprintf(stderr, "fr-offline: 第 %d 行：rdm 解析/越界（%s）\n", no, d.c_str());
+				return false;
+			}
+			rows.erase(rows.begin() + pos);
+			continue;
+		}
+		std::fprintf(stderr, "fr-offline: 第 %d 行：未知增量行（%s）\n", no, d.c_str());
+		return false;
+	}
+	s.frames[idx] = rows;
+	return true;
+}
+
+// pd 参数改写（全名 draw/rect 行内单参数替换——pd 仅作用于 draw 行身份，
+// rect 等无资产行不建身份）。按 op 签名序定位参数位，重写为 %.6f 绝对值。
+static bool pd_rewrite_param(std::string &row, const char *param, float val)
+{
+	// draw 签名：tex quad x y rot sx sy ox oy + rgba8
+	// pd 白名单（gen 侧已守）：x y rot sx sy ox oy —— 位序 3..9（1 起 token 序）
+	static const struct { const char *name; int tok; } kPos[] = {
+		{"x", 3}, {"y", 4}, {"rot", 5}, {"sx", 6}, {"sy", 7}, {"ox", 8}, {"oy", 9},
+	};
+	int tok = -1;
+	for (auto &p : kPos)
+		if (strcmp(param, p.name) == 0) { tok = p.tok; break; }
+	if (tok < 0)
+		return false;
+	// token 重写（空格分隔；rgba8 是 4 token 但都在改写位之后，不受影响）
+	std::vector<std::string> toks;
+	std::istringstream iss(row);
+	std::string t;
+	while (iss >> t) toks.push_back(t);
+	if ((int) toks.size() < tok || toks[0] != "draw")
+		return false;
+	char v[64];
+	snprintf(v, sizeof(v), "%.6f", val);
+	toks[tok] = v;
+	std::string out;
+	for (size_t i = 0; i < toks.size(); i++)
+		out += (i ? " " : "") + toks[i];
+	row = out;
+	return true;
+}
+
+// :px 短名行 → 全名（B15 展开器用——denorm_px lambda 的自由函数版）
+static std::string denorm_px_line(const std::string &ln)
+{
+	static const struct { const char *s, *l; } k[] = {
+		{"D ", "draw "}, {"R ", "rect "}, {"C ", "clear "}, {"PR ", "print "},
+		{"LN ", "line "}, {"CI ", "circle "}, {"PY ", "poly "}, {"AR ", "arc "},
+		{"PT ", "points "}, {"SC ", "scissor "},
+	};
+	for (auto &m : k)
+		if (ln.compare(0, std::strlen(m.s), m.s) == 0)
+			return std::string(m.l) + ln.substr(std::strlen(m.s));
+	return ln;
+}
+
+
+// 文本（.fr canonical）→ 会话（行号 1 起报错；行必须位于 frame 块内；帧号
+// 连续）。out 行只收本层执行
 // 域（clear/draw/print/rect），dt/cmnt 跳过——fr_check 已保证 canonical。
 static int offline_parse_text(const std::string &buf, OfflineSession &s)
 {
@@ -1907,6 +2055,8 @@ static int offline_parse_text(const std::string &buf, OfflineSession &s)
 	s.height = h;
 
 	bool in_frame = false;
+	std::vector<std::string> delta_rows; // B15：当帧增量行（帧末统一展开）
+	size_t cur_frame_idx = 0;           // 当前帧号（S 的 ref 索引）
 	for (size_t i = 1; i < lines.size(); i++)
 	{
 		const std::string &ln = lines[i];
@@ -1923,6 +2073,13 @@ static int offline_parse_text(const std::string &buf, OfflineSession &s)
 		}
 		if (ln.compare(0, 6, "frame ") == 0)
 		{
+			// 帧边界：先展开上一帧的增量行（若积压）
+			if (!delta_rows.empty())
+			{
+				if (!expand_delta_frame(s, cur_frame_idx, delta_rows, no))
+					return 3;
+				delta_rows.clear();
+			}
 			unsigned n = 0;
 			if (sscanf(ln.c_str(), "frame %u", &n) != 1 || n != s.frames.size())
 			{
@@ -1931,6 +2088,7 @@ static int offline_parse_text(const std::string &buf, OfflineSession &s)
 				return 3;
 			}
 			s.frames.push_back(std::vector<std::string>());
+			cur_frame_idx = s.frames.size() - 1;
 			in_frame = true;
 			continue;
 		}
@@ -1965,20 +2123,19 @@ static int offline_parse_text(const std::string &buf, OfflineSession &s)
 			}
 			continue;
 		}
-		// B14 :px 短名行收容 + 行首规范化（短名→全名 rewrite，exec 分发层
-		//零改动；量化数值 sscanf %f 天然兼容整数形态）。省略尾由 exec 的
-		//draw 分支按返回值回填（px 档唯一省略 op）。
-		auto denorm_px = [&ln](void) -> std::string {
-			static const struct { const char *s, *l; } k[] = {
-				{"D ", "draw "}, {"R ", "rect "}, {"C ", "clear "}, {"PR ", "print "},
-				{"LN ", "line "}, {"CI ", "circle "}, {"PY ", "poly "}, {"AR ", "arc "},
-				{"PT ", "points "}, {"SC ", "scissor "},
-			};
-			for (auto &m : k)
-				if (ln.compare(0, std::strlen(m.s), m.s) == 0)
-					return std::string(m.l) + ln.substr(std::strlen(m.s));
-			return ln;
-		};
+		// B14 :px 短名行收容 + 行首规范化（复用 denorm_px_line；量化数值
+		// sscanf %f 天然兼容整数形态）。省略尾由 exec 的 draw 分支按返回值
+		// 回填（px 档唯一省略 op）。
+		auto denorm_px = [&ln](void) -> std::string { return denorm_px_line(ln); };
+		// B15 增量行收容：S/pd/rdm/rdp（含全名与 :px 同形短名——S 恒短名）。
+		// 收集进 delta_rows（帧末统一展开——S 需查 ref 帧，逐行展开会破坏
+		// 后续行的 pos 定位）。
+		if (ln.compare(0, 2, "S ") == 0 || ln.compare(0, 3, "pd ") == 0
+		    || ln.compare(0, 4, "rdp ") == 0 || ln.compare(0, 4, "rdm ") == 0)
+		{
+			delta_rows.push_back(ln);
+			continue;
+		}
 		if (ln.compare(0, 6, "clear ") == 0 || ln.compare(0, 5, "draw ") == 0
 		    || ln.compare(0, 6, "print ") == 0 || ln.compare(0, 5, "rect ") == 0
 		    || ln.compare(0, 5, "line ") == 0 || ln.compare(0, 7, "circle ") == 0
@@ -1997,6 +2154,12 @@ static int offline_parse_text(const std::string &buf, OfflineSession &s)
 		}
 		std::fprintf(stderr, "fr-offline: 第 %d 行：离线回放不支持的非 out 行（B8 op 域）\n", no);
 		return 3;
+	}
+	// 文件结束：末帧积压增量展开（无下一帧边界触发）
+	if (!delta_rows.empty())
+	{
+		if (!expand_delta_frame(s, cur_frame_idx, delta_rows, (int) lines.size()))
+			return 3;
 	}
 	return 0;
 }
