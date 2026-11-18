@@ -3367,6 +3367,7 @@ static const luaL_Reg functions[] =
 	{ "_frCRC32", fr::w_frCRC32 },               // B7a：字符串 CRC32（d_crc 行数据源出口）
 	{ "_frCanvasProbe", fr::w_frCanvasProbe },
 	{ "_frOfflineReplay", fr::w_frOfflineReplay },
+	{ "_frOfflineAppend", fr::w_frOfflineAppend }, // M2 §9：交互式增量回放（Runner 游戏）
 	{ "_frStateRoot", fr::w_frStateRoot },       // B6 Task 1b：登记状态根（子图 s_crc 口径）
 	{ "_frStateSubCRC", fr::w_frStateSubCRC },   // B6 Task 1b：子图 CRC 显式出口（验证帧/sim）
 	{ "_frStateCRC", fr::w_frStateCRC },         // B6：全堆 CRC 口径保留（审计/对照）

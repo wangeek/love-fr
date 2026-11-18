@@ -200,6 +200,22 @@ bool fr_take_pending_dt(double &out)
 	return true;
 }
 
+double fr_fixed_dt()
+{
+	static double v = -1.0; // -1=未解析
+	if (v < 0)
+	{
+		v = 0.0;
+		if (const char *e = getenv("FR_DT"))
+		{
+			double d = strtod(e, nullptr);
+			if (d > 0)
+				v = d;
+		}
+	}
+	return v;
+}
+
 const std::vector<std::string> &fr_view_rows() { return rows(); }
 const std::vector<std::string> &fr_view_err_rows() { return err_rows(); }
 const std::vector<std::string> &fr_view_ev_rows() { return ev_rows(); }
@@ -1898,45 +1914,68 @@ static bool expand_delta_frame(OfflineSession &s, size_t idx,
 		rows = s.frames[idx - 1];
 	for (const std::string &d : delta_rows)
 	{
-		if (d.compare(0, 2, "S ") == 0)
+		if (d.compare(0, 3, "CP ") == 0 || d == "CP")
 		{
-			unsigned ref = 0;
-			if (sscanf(d.c_str(), "S %u", &ref) != 1 || ref >= s.frames.size() || ref >= idx)
+			unsigned ref = idx > 0 ? (unsigned) (idx - 1) : 0;
+			if (d.compare(0, 3, "CP ") == 0
+			    && (sscanf(d.c_str(), "CP %u", &ref) != 1
+			        || ref >= s.frames.size() || ref >= idx))
 			{
-				std::fprintf(stderr, "fr-offline: 第 %d 行：S ref 非法（%s）\n", no, d.c_str());
+				std::fprintf(stderr, "fr-offline: 第 %d 行：CP ref 非法（%s）\n", no, d.c_str());
 				return false;
 			}
-			// S 行集语义：本帧 out 行集 = ref 帧 out 行集（引用当前展开态）
+			if (d == "CP" && idx == 0)
+			{
+				std::fprintf(stderr, "fr-offline: 第 %d 行：裸 CP 无基线（帧 0）\n", no);
+				return false;
+			}
+			// CP 行集语义：本帧 out 行集 = ref 帧 out 行集（引用当前展开态）
 			rows = s.frames[ref];
 			continue;
 		}
-		if (d.compare(0, 3, "pd ") == 0)
+		if (d.compare(0, 4, "SET ") == 0)
 		{
 			unsigned asset = 0, k = 0;
 			char param[8] = {0};
 			float val = 0;
-			if (sscanf(d.c_str(), "pd %u %u %7s %f", &asset, &k, param, &val) != 4)
+			if (sscanf(d.c_str(), "SET %u %u %7s %f", &asset, &k, param, &val) != 4)
 			{
-				std::fprintf(stderr, "fr-offline: 第 %d 行：pd 解析失败（%s）\n", no, d.c_str());
+				std::fprintf(stderr, "fr-offline: 第 %d 行：SET 解析失败（%s）\n", no, d.c_str());
 				return false;
 			}
-			// 身份配对：帧内引用序（该 asset 第 k 次出现，0 起）
+			// LLM 引号习惯宽容：param 可能带引号（str 字段惯性）——剥掉
+			{
+				char *w = param, *r2 = param;
+				while (*r2)
+				{
+					if (*r2 != '"')
+						*w++ = *r2;
+					++r2;
+				}
+				*w = 0;
+			}
+			// 身份配对：帧内引用序（该 asset 第 k 次出现，0 起）。行可能是
+			// :px 省略形（dream 直写流——D 短名+尾省略）：先 denorm 全名，
+			// 改写位缺 token 时按 draw 默认补齐（rot=0 sx=sy=1 ox=oy=0）。
 			unsigned seen = 0;
 			bool matched = false;
 			for (auto &r : rows)
 			{
+				std::string full = denorm_px_line(r);
 				unsigned ta = 0, qa = 0;
 				char rest[256];
-				if (sscanf(r.c_str(), "draw %u %u %255[^\n]", &ta, &qa, rest) == 3 && ta == asset)
+				if (sscanf(full.c_str(), "draw %u %u %255[^\n]", &ta, &qa, rest) == 3
+				    && ta == asset)
 				{
 					if (seen == k)
 					{
 						// 参数替换（全名行——denorm 已做）：按 op 签名逐字段重写
-						if (!pd_rewrite_param(r, param, val))
+						if (!pd_rewrite_param(full, param, val))
 						{
-							std::fprintf(stderr, "fr-offline: 第 %d 行：pd 改写失败（%s）\n", no, r.c_str());
+							std::fprintf(stderr, "fr-offline: 第 %d 行：SET 改写失败（%s）\n", no, full.c_str());
 							return false;
 						}
+						r = full;
 						matched = true;
 						break;
 					}
@@ -1945,12 +1984,12 @@ static bool expand_delta_frame(OfflineSession &s, size_t idx,
 			}
 			if (!matched)
 			{
-				std::fprintf(stderr, "fr-offline: 第 %d 行：pd 身份 (%u,%u) 未配对\n", no, asset, k);
+				std::fprintf(stderr, "fr-offline: 第 %d 行：SET 身份 (%u,%u) 未配对\n", no, asset, k);
 				return false;
 			}
 			continue;
 		}
-		if (d.compare(0, 4, "rdp ") == 0)
+		if (d.compare(0, 4, "INS ") == 0)
 		{
 			unsigned pos = 0;
 			// 手工扫描引号内转义（嵌套引号：print 行文本域含 \"）——
@@ -1979,7 +2018,7 @@ static bool expand_delta_frame(OfflineSession &s, size_t idx,
 			}
 			if (*q != '"' || pos > rows.size())
 			{
-				std::fprintf(stderr, "fr-offline: 第 %d 行：rdp 未闭合/越界（%s）\n", no, d.c_str());
+				std::fprintf(stderr, "fr-offline: 第 %d 行：INS 未闭合/越界（%s）\n", no, d.c_str());
 				return false;
 			}
 			// 内嵌行 :px denorm（短名→全名，exec 层统一口径）
@@ -1987,12 +2026,12 @@ static bool expand_delta_frame(OfflineSession &s, size_t idx,
 			rows.insert(rows.begin() + pos, full);
 			continue;
 		}
-		if (d.compare(0, 4, "rdm ") == 0)
+		if (d.compare(0, 4, "DEL ") == 0)
 		{
 			unsigned pos = 0;
-			if (sscanf(d.c_str(), "rdm %u", &pos) != 1 || pos >= rows.size())
+			if (sscanf(d.c_str(), "DEL %u", &pos) != 1 || pos >= rows.size())
 			{
-				std::fprintf(stderr, "fr-offline: 第 %d 行：rdm 解析/越界（%s）\n", no, d.c_str());
+				std::fprintf(stderr, "fr-offline: 第 %d 行：DEL 解析/越界（%s）\n", no, d.c_str());
 				return false;
 			}
 			rows.erase(rows.begin() + pos);
@@ -2019,13 +2058,20 @@ static bool pd_rewrite_param(std::string &row, const char *param, float val)
 		if (strcmp(param, p.name) == 0) { tok = p.tok; break; }
 	if (tok < 0)
 		return false;
-	// token 重写（空格分隔；rgba8 是 4 token 但都在改写位之后，不受影响）
+	// token 重写（空格分隔；rgba8 是 4 token 但都在改写位之后，不受影响）；
+	// :px 省略形行 token 数不足改写位时，按 draw 默认补齐缺位（rot=0 sx=sy=1
+	// ox=oy=0、color 白——pd 白名单最远 oy=9，color 位不会被改写）
 	std::vector<std::string> toks;
 	std::istringstream iss(row);
 	std::string t;
 	while (iss >> t) toks.push_back(t);
-	if ((int) toks.size() < tok || toks[0] != "draw")
+	if (toks.empty() || toks[0] != "draw")
 		return false;
+	static const char *kDrawDefaults[] = {"0", "0", "0", "0", "0", "0", "0",
+	                                       "0", "255", "255", "255", "255", "255"};
+	// 位序（1 起）：tex=1 quad=2 x=3 y=4 rot=5 sx=6 sy=7 ox=8 oy=9 color=10..13
+	while ((int) toks.size() <= tok)
+		toks.push_back(kDrawDefaults[toks.size()]);
 	char v[64];
 	snprintf(v, sizeof(v), "%.6f", val);
 	toks[tok] = v;
@@ -2054,37 +2100,17 @@ static std::string denorm_px_line(const std::string &ln)
 // 文本（.fr canonical）→ 会话（行号 1 起报错；行必须位于 frame 块内；帧号
 // 连续）。out 行只收本层执行
 // 域（clear/draw/print/rect），dt/cmnt 跳过——fr_check 已保证 canonical。
-static int offline_parse_text(const std::string &buf, OfflineSession &s)
+// T1（M2 §9）：行解析核——offline_parse_text 全量与 _frOfflineAppend 增量续解析
+// 共用。状态外提（in_frame/delta_rows/cur_frame_idx 由调用方持有，跨调用保续）。
+// no 口径：lines 为全量缓冲切片，行号=i+1（错误信息与全量解析一致）。
+// d_crc 行=帧块闭合标记：此处冲刷当帧积压增量（M2 交互必需——末帧渲染不
+// 等下一帧头；全量路径结果等价：展开时机提前、产物相同）。
+static int offline_parse_lines(const std::vector<std::string> &lines, size_t from,
+                               OfflineSession &s, bool &in_frame,
+                               std::vector<std::string> &delta_rows,
+                               size_t &cur_frame_idx)
 {
-	if (buf.empty() || buf.back() != '\n')
-	{
-		std::fprintf(stderr, "fr-offline: 第 1 行：文本必须以单个 LF 结尾\n");
-		return 3;
-	}
-
-	std::vector<std::string> lines;
-	size_t start = 0;
-	while (start < buf.size())
-	{
-		size_t end = buf.find('\n', start);
-		lines.push_back(buf.substr(start, end - start));
-		start = end + 1;
-	}
-
-	int w = 0, h = 0;
-	if (lines.empty() || sscanf(lines[0].c_str(), "frb1 %d %d", &w, &h) != 2
-	    || w <= 0 || h <= 0)
-	{
-		std::fprintf(stderr, "fr-offline: 第 1 行：会话头必须为 'frb1 w h sha loglvl seed'\n");
-		return 3;
-	}
-	s.width = w;
-	s.height = h;
-
-	bool in_frame = false;
-	std::vector<std::string> delta_rows; // B15：当帧增量行（帧末统一展开）
-	size_t cur_frame_idx = 0;           // 当前帧号（S 的 ref 索引）
-	for (size_t i = 1; i < lines.size(); i++)
+	for (size_t i = from; i < lines.size(); i++)
 	{
 		const std::string &ln = lines[i];
 		int no = (int) i + 1;
@@ -2134,7 +2160,16 @@ static int offline_parse_text(const std::string &buf, OfflineSession &s)
 		if (ln.compare(0, 6, "s_crc ") == 0)
 			continue; // 同上：s_crc 是内核堆快照，离线无 kernel 只跳过（B6）
 		if (ln.compare(0, 6, "d_crc ") == 0)
-			continue; // 同上：d_crc 是录制侧 out 行 CRC（B7a），离线执行域只重算 D_CRC，不消费
+		{
+			// B7a 录制侧 CRC 只跳过；M2 交互：块末冲刷积压增量（见上注）
+			if (!delta_rows.empty())
+			{
+				if (!expand_delta_frame(s, cur_frame_idx, delta_rows, no))
+					return 3;
+				delta_rows.clear();
+			}
+			continue;
+		}
 		if (ln.compare(0, 3, "ev ") == 0)
 			continue; // B10 C tee 会产 ev 行（in 段事实）——离线无 kernel 不注入，跳过
 		if (ln.compare(0, 4, "err ") == 0)
@@ -2154,11 +2189,11 @@ static int offline_parse_text(const std::string &buf, OfflineSession &s)
 		// sscanf %f 天然兼容整数形态）。省略尾由 exec 的 draw 分支按返回值
 		// 回填（px 档唯一省略 op）。
 		auto denorm_px = [&ln](void) -> std::string { return denorm_px_line(ln); };
-		// B15 增量行收容：S/pd/rdm/rdp（含全名与 :px 同形短名——S 恒短名）。
-		// 收集进 delta_rows（帧末统一展开——S 需查 ref 帧，逐行展开会破坏
-		// 后续行的 pos 定位）。
-		if (ln.compare(0, 2, "S ") == 0 || ln.compare(0, 3, "pd ") == 0
-		    || ln.compare(0, 4, "rdp ") == 0 || ln.compare(0, 4, "rdm ") == 0)
+		// B15/v1.5 增量行收容：CP/SET/INS/DEL（Tier1 新名；裸 CP=引用上一帧）。
+		// 收集进 delta_rows（帧末统一展开——CP 需查 ref 帧，逐行展开会破坏
+		// 后续行的 pos 定位）。expand_delta_frame 对裸 CP 回填 ref=idx-1。
+		if (ln == "CP" || ln.compare(0, 3, "CP ") == 0 || ln.compare(0, 4, "SET ") == 0
+		    || ln.compare(0, 4, "INS ") == 0 || ln.compare(0, 4, "DEL ") == 0)
 		{
 			delta_rows.push_back(ln);
 			continue;
@@ -2182,6 +2217,42 @@ static int offline_parse_text(const std::string &buf, OfflineSession &s)
 		std::fprintf(stderr, "fr-offline: 第 %d 行：离线回放不支持的非 out 行（B8 op 域）\n", no);
 		return 3;
 	}
+	return 0;
+}
+
+static int offline_parse_text(const std::string &buf, OfflineSession &s)
+{
+	if (buf.empty() || buf.back() != '\n')
+	{
+		std::fprintf(stderr, "fr-offline: 第 1 行：文本必须以单个 LF 结尾\n");
+		return 3;
+	}
+
+	std::vector<std::string> lines;
+	size_t start = 0;
+	while (start < buf.size())
+	{
+		size_t end = buf.find('\n', start);
+		lines.push_back(buf.substr(start, end - start));
+		start = end + 1;
+	}
+
+	int w = 0, h = 0;
+	if (lines.empty() || sscanf(lines[0].c_str(), "frb1 %d %d", &w, &h) != 2
+	    || w <= 0 || h <= 0)
+	{
+		std::fprintf(stderr, "fr-offline: 第 1 行：会话头必须为 'frb1 w h sha loglvl seed'\n");
+		return 3;
+	}
+	s.width = w;
+	s.height = h;
+
+	bool in_frame = false;
+	std::vector<std::string> delta_rows; // B15：当帧增量行（帧末统一展开）
+	size_t cur_frame_idx = 0;           // 当前帧号（S 的 ref 索引）
+	int rc = offline_parse_lines(lines, 1, s, in_frame, delta_rows, cur_frame_idx);
+	if (rc != 0)
+		return rc;
 	// 文件结束：末帧积压增量展开（无下一帧边界触发）
 	if (!delta_rows.empty())
 	{
@@ -2660,6 +2731,23 @@ int fr_offline_replay(lua_State *L, const char *path, love::graphics::Graphics *
 			std::printf("D_CRC %d %u\n", (int) fi + 1,
 			            fr_crc32_bytes(img->getData(), img->getSize()));
 
+			// FR_VIDEO_OUT（B18 视频审看）：逐帧原始像素 append 到 env 指定
+			// 文件（RGBA8，尺寸=会话几何）——Python 侧 ffmpeg rawvideo 封装
+			// 成 mp4。流的投影衍生品（审看介质）：不进判据不进校验和（D10/D14）。
+			{
+				static FILE *vout = nullptr;
+				static bool vinit = false;
+				if (!vinit)
+				{
+					vinit = true;
+					const char *vp = std::getenv("FR_VIDEO_OUT");
+					if (vp != nullptr)
+						vout = std::fopen(vp, "wb");
+				}
+				if (vout != nullptr)
+					std::fwrite(img->getData(), 1, img->getSize(), vout);
+			}
+
 			if (fi + 1 == s.frames.size())
 			{
 				// 三采样像素（live 验证帧同点同换算：getPixel + floor(c*255+0.5)）
@@ -2758,6 +2846,169 @@ int w_frOfflineReplay(lua_State *L)
 	love::graphics::Graphics *gfx =
 		love::Module::getInstance<love::graphics::Graphics>(love::Module::M_GRAPHICS);
 	lua_pushinteger(L, fr_offline_replay(L, path, gfx));
+	return 1;
+}
+
+// ------------------------------------------------------------------
+// M2 §9：交互式增量回放（Runner 游戏的渲染后端，dream/runner）
+// ------------------------------------------------------------------
+
+struct FrIact
+{
+	bool header_done = false;
+	std::string buf;                 // 全量文本（append-only 累积）
+	size_t file_off = 0;             // 已读入的文件偏移
+	size_t parsed_lines = 0;         // 已解析行数（续解析起点）
+	OfflineSession s;
+	bool in_frame = false;
+	std::vector<std::string> delta_rows;
+	size_t cur_frame_idx = 0;
+	love::graphics::Canvas *canvas = nullptr;
+	size_t rendered = 0;             // 已渲染帧数（下一帧索引同值）
+	bool advanced_once = false;
+	double last_advance = 0.0;
+};
+static FrIact g_iact;
+
+// 每帧调用（Runner 的 love.draw）：探测 .fr 增长 → 续解析（只到最后一个
+// '\n'，写半行留待下轮）→ 按流内 dt 节奏至多推进一帧（渲染到常驻 canvas）
+// → canvas 贴屏。返回当前已渲染帧号（ev 上报用；无帧 -1）；解析错误 -2。
+// 空闲（无新帧）：只贴屏——末帧反复绘制，流不增（M2 §9 用户裁决③）。
+int fr_offline_append(lua_State *L, const char *path, love::graphics::Graphics *gfx)
+{
+	(void) L;
+	if (gfx == nullptr)
+		return -2;
+	FrIact &g = g_iact;
+
+	FILE *f = std::fopen(path, "rb");
+	if (f == nullptr)
+	{
+		std::fprintf(stderr, "fr-iact: 打不开流文件 %s\n", path);
+		return -2;
+	}
+	std::fseek(f, 0, SEEK_END);
+	long sz = std::ftell(f);
+	if (sz > 0 && (size_t) sz > g.file_off)
+	{
+		std::fseek(f, (long) g.file_off, SEEK_SET);
+		std::string add;
+		char chunk[65536];
+		size_t n;
+		while ((n = std::fread(chunk, 1, sizeof(chunk), f)) > 0)
+			add.append(chunk, n);
+		std::fclose(f);
+		size_t last_nl = add.rfind('\n');
+		if (last_nl != std::string::npos)
+		{
+			g.file_off += last_nl + 1;
+			g.buf += add.substr(0, last_nl + 1);
+
+			std::vector<std::string> lines;
+			size_t start = 0;
+			while (start < g.buf.size())
+			{
+				size_t end = g.buf.find('\n', start);
+				lines.push_back(g.buf.substr(start, end - start));
+				start = end + 1;
+			}
+			size_t from = g.parsed_lines;
+			if (!g.header_done)
+			{
+				int w = 0, h = 0;
+				if (lines.empty()
+				    || sscanf(lines[0].c_str(), "frb1 %d %d", &w, &h) != 2
+				    || w <= 0 || h <= 0)
+				{
+					std::fprintf(stderr, "fr-iact: 会话头非法\n");
+					return -2;
+				}
+				g.s.width = w;
+				g.s.height = h;
+				g.header_done = true;
+				from = 1;
+			}
+			if (offline_parse_lines(lines, from, g.s, g.in_frame,
+			                        g.delta_rows, g.cur_frame_idx) != 0)
+				return -2;
+			g.parsed_lines = lines.size();
+		}
+	}
+	else
+		std::fclose(f);
+
+	// 常驻画布（_frNewCanvasReal 同款：会话几何、dpiScale=1）
+	if (g.canvas == nullptr && !g.s.frames.empty())
+	{
+		love::graphics::Canvas::Settings settings;
+		settings.width = g.s.width;
+		settings.height = g.s.height;
+		settings.dpiScale = 1.0f;
+		try
+		{
+			g.canvas = gfx->newCanvas(settings);
+		}
+		catch (love::Exception &e)
+		{
+			std::fprintf(stderr, "fr-iact: newCanvas 失败：%s\n", e.what());
+			return -2;
+		}
+	}
+
+	// 节奏推进一帧（流内 dt；下限 1/60 同 FR_PLAY——播放是给人看的）
+	love::timer::Timer *timer =
+		love::Module::getInstance<love::timer::Timer>(love::Module::M_TIMER);
+	double now = timer != nullptr ? timer->getTime() : 0.0;
+	if (g.canvas != nullptr && g.s.frames.size() > g.rendered)
+	{
+		double dt = g.rendered < g.s.dts.size() ? g.s.dts[g.rendered] : (1.0 / 15.0);
+		if (dt < 1.0 / 60.0)
+			dt = 1.0 / 60.0;
+		if (!g.advanced_once || now - g.last_advance >= dt)
+		{
+			try
+			{
+				love::graphics::Graphics::RenderTargets rts;
+				rts.colors.emplace_back(g.canvas, 0);
+				gfx->setCanvas(rts);
+				g_replay_baseline = rts;      // B8 T3：离线画布即会话基线
+				g_replay_baseline_canvas = true;
+				for (const std::string &row : g.s.frames[g.rendered])
+					capture_exec_row(gfx, row);
+				g_replay_baseline_canvas = false;
+				gfx->setCanvas();
+			}
+			catch (love::Exception &e)
+			{
+				std::fprintf(stderr, "fr-iact: 帧渲染失败：%s\n", e.what());
+				return -2;
+			}
+			g.rendered++;
+			g.last_advance = now;
+			g.advanced_once = true;
+		}
+	}
+
+	// 贴屏（缩放适配窗口；空闲=末帧反复绘制）
+	if (g.canvas != nullptr)
+	{
+		gfx->setCanvas();
+		gfx->origin();
+		float sx = (float) gfx->getWidth() / (float) g.canvas->getPixelWidth();
+		float sy = (float) gfx->getHeight() / (float) g.canvas->getPixelHeight();
+		gfx->setColor(love::Colorf(1.0f, 1.0f, 1.0f, 1.0f));
+		love::Matrix4 m(0.0f, 0.0f, 0.0f, sx, sy, 0.0f, 0.0f, 0.0f, 0.0f);
+		gfx->draw((love::graphics::Drawable *) g.canvas, m);
+	}
+	return g.rendered > 0 ? (int) g.rendered - 1 : -1;
+}
+
+int w_frOfflineAppend(lua_State *L)
+{
+	const char *path = luaL_checkstring(L, 1);
+	love::graphics::Graphics *gfx =
+		love::Module::getInstance<love::graphics::Graphics>(love::Module::M_GRAPHICS);
+	lua_pushinteger(L, fr_offline_append(L, path, gfx));
 	return 1;
 }
 

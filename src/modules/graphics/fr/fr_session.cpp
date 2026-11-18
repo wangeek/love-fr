@@ -16,7 +16,12 @@
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
+
+#if defined(_WIN32)
+#include <share.h> // _fsopen / _SH_DENYRW（独占写者护栏）
+#endif
 
 namespace fr
 {
@@ -26,6 +31,7 @@ static bool s_tried = false;     // env 解析一次（含禁用判定）
 static bool s_full = false;      // FR_LOGLEVEL=full
 static love::uint64 s_frame_no = 0;
 static love::uint64 s_max_frames = 0; // 0 = 无限
+static double s_max_bytes = 0.0;      // FR_MAX_MB（0 = 无限）
 static bool s_finished = false;
 
 // 游标（全会话累积缓冲 → 当帧 delta；demo take_delta 同构）
@@ -66,6 +72,53 @@ static bool valid_sha(const char *s)
 	return true;
 }
 
+// 打开失败的原因（disable 文案用；open_stream_file 内设置）
+static const char *s_open_reason = "文件打不开";
+
+// 流文件打开（2026-11-18 事故取证后的两道护栏，缺陷 1+2）：
+//
+// ① **存在即拒绝覆盖**：目标已存在且未显式 FR_OVERWRITE=1 → 停用写出。
+//    事故现场：后启动的进程用 "wb" 截断了另一个进程正在写的流，43,631 帧
+//    被静默抹掉，旧进程随后在 2.33GB 处续写，文件系统补出 2.22GB 零区。
+// ② **独占打开**（Windows `_SH_DENYRW`）：同路径第二个写者打不开，会拿到
+//    明确的共享冲突错误，而不是两个进程各持文件位置互相踩。
+//
+// 非 Windows 退回普通 fopen（护栏退化为仅"存在即拒"）。
+static FILE *open_stream_file(const char *path)
+{
+	const char *ow = getenv("FR_OVERWRITE");
+	bool overwrite = ow != nullptr && ow[0] != '\0'
+	                 && !strcmp(ow, "1");
+
+	if (!overwrite)
+	{
+		struct stat st;
+		if (stat(path, &st) == 0)
+		{
+			s_open_reason = "目标已存在，拒绝覆盖（防误伤正在写的流；"
+			                "要覆盖请设 FR_OVERWRITE=1）";
+			return nullptr;
+		}
+	}
+
+#if defined(_WIN32)
+	// _SH_DENYRW：拒绝他进程读写——单写者护栏
+	FILE *f = _fsopen(path, "wb", _SH_DENYRW);
+	if (f == nullptr)
+	{
+		s_open_reason = "文件打不开或已被其他进程独占写入"
+		                "（同一 FR_OUT 只允许一个写者）";
+		return nullptr;
+	}
+	return f;
+#else
+	FILE *f = std::fopen(path, "wb"); // canonical LF（"wb" 防 CRT 文本模式改写）
+	if (f == nullptr)
+		s_open_reason = "文件打不开";
+	return f;
+#endif
+}
+
 static void try_init(love::graphics::Graphics *gfx)
 {
 	s_tried = true;
@@ -96,6 +149,16 @@ static void try_init(love::graphics::Graphics *gfx)
 			s_max_frames = (love::uint64) n;
 	}
 
+	// FR_MAX_MB：按体积封口（防无界长跑——2026-11-18 取证：一条手工调试流
+	// 跑 41 万帧 / 20.4GB）。支持小数（如 0.5）便于测试与小场景。
+	const char *maxmb = getenv("FR_MAX_MB");
+	if (maxmb != nullptr && maxmb[0] != '\0')
+	{
+		double v = strtod(maxmb, nullptr);
+		if (v > 0)
+			s_max_bytes = v * 1024.0 * 1024.0;
+	}
+
 	const char *fdt = getenv("FR_DT");
 	if (fdt != nullptr && fdt[0] != '\0')
 	{
@@ -116,16 +179,31 @@ static void try_init(love::graphics::Graphics *gfx)
 		if (v >= 0) s_delta_i = (love::uint64) v;
 	}
 
-	s_fh = std::fopen(out, "wb"); // canonical LF（"wb" 防 CRT 文本模式改写）
+	s_fh = open_stream_file(out);
 	if (s_fh == nullptr)
 	{
-		disable("文件打不开");
+		disable(s_open_reason);
 		return;
 	}
 
-	// 会话头（demo write_session 同构；几何 = 当前逻辑窗口尺寸）
-	int w = gfx != nullptr ? gfx->getWidth() : 640;
-	int h = gfx != nullptr ? gfx->getHeight() : 480;
+	// 会话头（demo write_session 同构；几何 = 当前逻辑窗口尺寸）。
+	// 无头（t.window=false）时 getWidth() 返 0——FR_W/FR_H 显式钉几何，
+	// 否则回退 640×480（demo conf 域；B10 C-tee 无头首证 2026-11-07：
+	// 原样落盘 `frb1 0 0` 致流不可 parse）
+	int w = gfx != nullptr ? gfx->getWidth() : 0;
+	int h = gfx != nullptr ? gfx->getHeight() : 0;
+	if (const char *e = getenv("FR_W"))
+	{
+		long v = strtol(e, nullptr, 10);
+		if (v > 0) w = (int) v;
+	}
+	if (const char *e = getenv("FR_H"))
+	{
+		long v = strtol(e, nullptr, 10);
+		if (v > 0) h = (int) v;
+	}
+	if (w <= 0) w = 640;
+	if (h <= 0) h = 480;
 	std::fprintf(s_fh, "frb1 %d %d %s %s %ld%s\n", w, h, sha,
 	             s_full ? "full" : "base", seedv, s_delta ? " +d" : "");
 	std::fprintf(s_fh, "cmnt fr fork c-tee session\n");
@@ -142,6 +220,15 @@ void fr_session_frame(love::graphics::Graphics *gfx)
 	if (s_max_frames != 0 && s_frame_no >= s_max_frames)
 	{
 		fr_session_finish(); // 到限封口（进程照常跑）
+		return;
+	}
+	// FR_MAX_MB 体积封口（缺陷 3）：ftell 读 FILE* 缓冲态位置，代价可忽略；
+	// 越过即封口——不留下一条 20GB 无法判定的流
+	if (s_max_bytes > 0.0 && (double) std::ftell(s_fh) >= s_max_bytes)
+	{
+		std::fprintf(stderr, "fr: 流体积达上限 %.2f MB（FR_MAX_MB）→ 封口\n",
+		             s_max_bytes / (1024.0 * 1024.0));
+		fr_session_finish();
 		return;
 	}
 
@@ -220,7 +307,7 @@ void fr_session_frame(love::graphics::Graphics *gfx)
 		}
 		else if (cur_rows == s_ref_rows)
 		{
-			std::fprintf(s_fh, "S %llu\n", (unsigned long long) s_ref_frame);
+			std::fprintf(s_fh, "CP %llu\n", (unsigned long long) s_ref_frame);
 			wrote_same = true;
 		}
 		else
@@ -232,7 +319,7 @@ void fr_session_frame(love::graphics::Graphics *gfx)
 			size_t a = 0, b = 0; // ref 游标 / cur 游标
 			auto emit_del = [&](size_t pos)
 			{
-				std::fprintf(s_fh, "rdm %llu\n", (unsigned long long) pos);
+				std::fprintf(s_fh, "DEL %llu\n", (unsigned long long) pos);
 				rows.erase(rows.begin() + pos);
 			};
 			auto emit_ins = [&](size_t pos, const std::string &line)
@@ -244,7 +331,7 @@ void fr_session_frame(love::graphics::Graphics *gfx)
 					if (c == '"' || c == '\\') esc += '\\';
 					esc += c;
 				}
-				std::fprintf(s_fh, "rdp %llu \"%s\"\n",
+				std::fprintf(s_fh, "INS %llu \"%s\"\n",
 				             (unsigned long long) pos, esc.c_str());
 				rows.insert(rows.begin() + pos, line);
 			};
@@ -292,7 +379,7 @@ void fr_session_frame(love::graphics::Graphics *gfx)
 						    && ta == asset)
 							k++;
 					}
-					std::fprintf(s_fh, "pd %u %u %s %s\n", asset, k,
+					std::fprintf(s_fh, "SET %u %u %s %s\n", asset, k,
 					             kNames[diff], ct[diff].c_str());
 					rows[b] = cur_line; // 就地改写（workpiece 同步）
 					return true;
@@ -326,8 +413,11 @@ void fr_session_frame(love::graphics::Graphics *gfx)
 				}
 				if (used_pd && na == la && nb == lb)
 					continue; // 整块 pd 化完成
-				// 退回/剩余：编辑脚本（pd 已消费的游标已同步；剩余按块处理）
-				for (size_t i = 0; i < la - a; i++) { emit_del(b); a++; }
+				// 退回/剩余：编辑脚本（pd 已消费的游标已同步；剩余按块处理）。
+				// B15 pos 语义精确化：**先删后插**——删除 pos 用当前行序
+				//（递减发防收缩漂移），插入 pos 自 b 递增（扩张后即时位）——
+				// 展开器按行序应用，两端唯一可对齐的规范序。
+				for (size_t i = la; i > a; i--) { emit_del(a); a++; }
 				for (size_t i = 0; i < lb - b; i++) { emit_ins(b, cur_rows[b]); b++; }
 				a = la; b = lb;
 			}

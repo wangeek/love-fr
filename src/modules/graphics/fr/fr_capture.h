@@ -137,6 +137,10 @@ void capture_ev(int src, const std::string &name, const std::vector<love::Varian
 void fr_set_pending_dt(double dt);
 bool fr_take_pending_dt(double &out);
 
+// FR_DT 固定步长（w_step 覆写源；首调解析 env 缓存，0=未设——真值记录）。
+// agent-guide §1"固定步长（确定性录制）"的实现口（2026-11-07 兑现）。
+double fr_fixed_dt();
+
 // B9：SEH 崩溃探针（仅 Windows；FR_CRASH_PROBE=1 时由 present 钩懒装）。
 void fr_install_crash_probe();
 
@@ -255,5 +259,9 @@ int w_frImageDataCRC(lua_State *L);
 int w_frCRC32(lua_State *L);
 int w_frCanvasProbe(lua_State *L);
 int w_frOfflineReplay(lua_State *L);
+// M2 §9：交互式增量回放——Runner 游戏（dream/runner）每帧调用；
+// 探测 .fr 增长→续解析→按流内 dt 至多推进一帧→canvas 贴屏。
+// 返回当前已渲染帧号（ev 上报用；无帧 -1；解析错误 -2）。
+int w_frOfflineAppend(lua_State *L);
 
 } // fr

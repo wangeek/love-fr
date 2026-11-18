@@ -35,6 +35,11 @@ int w_step(lua_State *L)
 {
 	double dt = instance()->step();
 	// B10：帧头 dt 事实源（默认 run loop 每帧恰一次；writer 在 present 取走）。
+	// FR_DT 固定步长（agent-guide §1 语义：确定性录制，跳过真实计时）——
+	// 覆写 step 返回值与记录值（2026-11-07 E2E 实证：原实现只兜底不覆写，
+	// 帧 0 启动微秒抖动落 dt 行破双跑逐字节）
+	if (double fixed = fr::fr_fixed_dt())
+		dt = fixed;
 	fr::fr_set_pending_dt(dt);
 	lua_pushnumber(L, dt);
 	return 1;
