@@ -4,8 +4,8 @@
 > 基于 LÖVE 11.5（tag `11.5`），在 `fr-capture` 分支上加了引擎内的 **FR 帧流捕获与回放**。
 > 上游版权与许可（zlib）原样保留，见 [`license.txt`](license.txt)。
 >
-> 本仓库是浅历史：`fr-capture` = 官方 `11.5` 那个提交 + 之上的 FR 提交。
-> `11.5` 之前的上游历史不在这里，需要的话请看官方仓库。
+> `fr-capture` 分支带 LÖVE 截至 `11.5` 的完整历史，FR 提交都落在官方 `11.5` 之后；
+> tag `11.5` 就是上游那个发布标签本身，可以直接拿来做 diff。
 
 本仓库只放**引擎侧**改动。流的格式规格、Python 工具族（录制封装 / 判据 / diff / lint）、
 文档与测试都在主仓库 **[wangeek/AgentLove2d](https://github.com/wangeek/AgentLove2d)**——
