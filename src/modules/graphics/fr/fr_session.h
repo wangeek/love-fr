@@ -11,10 +11,21 @@
  *   ev 行（in 段，C 侧 pump/push 捕获）/ err 行（log 段，任何档）/
  *   st 行（log 段，仅 FR_LOGLEVEL=full）/ out 行 / s_crc / d_crc
  *
- * env：FR_OUT（路径，wb 二进制写防 CRT 文本模式 CRLF 改写）、FR_SHA
- *（64 hex 表指纹，缺/坏 → 禁用+stderr）、FR_SEED（缺省 0）、
- * FR_FRAMES（帧数上限，缺省无限；到限封口不杀进程）、FR_DT（dt 兜底，
- * 缺省 0.016667——游戏未调 timer.step 时用，一次性 stderr 告警）。
+ * env（均为可选；未设 FR_OUT 时整个写出器不启用、零开销）：
+ *   FR_OUT   流路径。**写者护栏（三条，见 open_stream_file 注释）**：
+ *            ① 目标已存在 → 默认拒绝覆盖并停用写出（FR_OVERWRITE=1 放行）；
+ *            ② 独占打开（Windows _fsopen+_SH_DENYRW）——同路径第二个写者
+ *               拿共享冲突，明确报错而不是互相踩；
+ *            ③ FR_MAX_MB 体积封口（帧边界判，末帧完整；支持小数）。
+ *   FR_SHA   64 hex 表指纹。缺省/非法 → 会话头记全 0 + stderr 告警
+ *            （不停用；判据对账需真指纹时由调用方显式给）。
+ *   FR_SEED  种子，写会话头（缺省 0）。
+ *   FR_FRAMES 帧数上限，缺省无限；到限封口不杀进程。
+ *   FR_DT    **固定步长——覆写 love.timer.step 的返回值**（游戏循环按它走，
+ *            是双跑逐字节的前提）。未设时记录真实 dt。
+ *   FR_W/FR_H 会话头几何；无头（t.window=false）时 getWidth() 返 0，
+ *            缺省回退 640×480（否则落盘 frb1 0 0，流不可解析）。
+ *   FR_LOGLEVEL=full → 写 st 行；FR_DELTA=1 → 增量编码（head 标 +d）。
  *
  * 保真度注记：第三方游戏未注册状态根 → s_crc 走全堆回退（同进程指纹
  * 有效，跨进程 sim 重演等值结构性不可达——B6 实证）；第三方 v1 判据
